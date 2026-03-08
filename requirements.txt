@@ -5,3 +5,4 @@ pycryptodome>=3.14.1
 lxml>=4.9.1
 cryptography>=38.0.0
 asn1crypto>=1.5.1
+rich>=13.0.0
