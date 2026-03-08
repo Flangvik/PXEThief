@@ -14,7 +14,6 @@ warnings.filterwarnings("ignore")
 
 def check_dependencies():
     module_names = {
-        'scapy': 'scapy>=2.5.0',
         'requests': 'requests>=2.27.1',
         'requests_toolbelt': 'requests-toolbelt>=0.9.1',
         'Crypto': 'pycryptodome>=3.14.1',
@@ -36,16 +35,9 @@ def check_dependencies():
 
 check_dependencies()
 
-import logging
-logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
-
-from scapy.all import *
-conf.verb = 0
-
 import binascii
 import ipaddress
 import socket
-import platform
 import configparser
 import math
 from Crypto.Cipher import AES, DES3
@@ -146,8 +138,38 @@ def _3des_decrypt(data, key):
 def _3des_decrypt_raw(data, key):
     return DES3.new(key, DES3.MODE_CBC, b"\x00" * 8).decrypt(data)
 
-#Scapy global variables
-osName = platform.system()
+_scapy_loaded = False
+
+def load_scapy():
+    """Load Scapy on demand — only needed for modes that use raw sockets or BOOTP/DHCP packet classes."""
+    global _scapy_loaded
+    if _scapy_loaded:
+        return
+
+    try:
+        import logging
+        logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+        from scapy.all import conf, srp1, sr1, BOOTP, DHCP, Ether, IP, UDP
+        from scapy.all import get_if_addr, get_if_hwaddr, get_if_raw_addr, bind_layers
+        from scapy.all import inet_ntop
+        import scapy.interfaces
+        conf.verb = 0
+    except ImportError:
+        print("[-] Scapy is required for this mode — pip install scapy>=2.5.0")
+        sys.exit(-1)
+
+    # Inject into module globals so existing code works
+    g = globals()
+    for name, obj in [('conf', conf), ('srp1', srp1), ('sr1', sr1), ('BOOTP', BOOTP),
+                       ('DHCP', DHCP), ('Ether', Ether), ('IP', IP), ('UDP', UDP),
+                       ('get_if_addr', get_if_addr), ('get_if_hwaddr', get_if_hwaddr),
+                       ('get_if_raw_addr', get_if_raw_addr), ('bind_layers', bind_layers),
+                       ('inet_ntop', inet_ntop), ('scapy', __import__('scapy'))]:
+        g[name] = obj
+
+    _scapy_loaded = True
+
+# Global state
 clientIPAddress = ""
 clientMacAddress = ""
 
@@ -410,6 +432,7 @@ def smb_download(server, remote_path, local_path):
         socket.socket = original_socket
 
 def print_interface_table():
+    load_scapy()
     warning("Set the interface to be used by scapy in [bold]manual_interface_selection_by_id[/] in settings.ini")
     console.print()
     console.print(conf.ifaces)
@@ -423,6 +446,8 @@ def configure_scapy_networking(ip_address):
     if SOCKS5_PROXY:
         configure_proxy_networking()
         return
+
+    load_scapy()
 
     if ip_address is not None:
         ip_address = validate_ip_or_resolve_hostname(ip_address)
@@ -494,6 +519,7 @@ def configure_scapy_networking(ip_address):
     success(f"Using interface: [bold]{conf.iface}[/] — {iface_desc}")
 
 def find_pxe_server():
+    load_scapy()
     info("Sending DHCP Discover to find PXE boot server...")
 
     pkt = Ether(dst="ff:ff:ff:ff:ff:ff")/IP(src="0.0.0.0",dst="255.255.255.255")/UDP(sport=68,dport=67)/BOOTP(chaddr=clientMacAddress)/DHCP(options=[("message-type","discover"),('param_req_list',[1,3,6,66,67]),"end"])
@@ -523,6 +549,7 @@ def find_pxe_server():
     return tftp_server
 
 def get_variable_file_path(tftp_server):
+    load_scapy()
     info("Asking ConfigMgr for media variables and BCD file locations...")
 
     dhcp_options_list = [
@@ -828,7 +855,7 @@ def use_encrypted_key(encrypted_key, media_file_path):
 
     LEADING_BIT_MASK = b'\x80'
     new_key = bytearray()
-    for byte in struct.unpack('10c', var_file_key):
+    for byte in pystruct.unpack('10c', var_file_key):
         if (LEADING_BIT_MASK[0] & byte[0]) == 128:
             new_key = new_key + byte + b'\xFF'
         else:
