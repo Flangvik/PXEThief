@@ -749,23 +749,43 @@ def process_naa_xml(naa_xml):
         return
 
     for naa_settings in network_access_account_xml:
+        username_el = naa_settings.xpath(".//*[@name='NetworkAccessUsername']")
+        password_el = naa_settings.xpath(".//*[@name='NetworkAccessPassword']")
+
+        if not username_el or not password_el:
+            warning("NAA entry found but missing username/password XML elements")
+            continue
+
+        raw_username = username_el[0].find("value").text
+        raw_password = password_el[0].find("value").text
+
+        if not raw_username or not raw_password:
+            warning("NAA entry found but credential values are null")
+            continue
+
         try:
-            network_access_username = deobfuscate_credential_string(naa_settings.xpath(".//*[@name='NetworkAccessUsername']")[0].find("value").text)
+            network_access_username = deobfuscate_credential_string(raw_username)
             network_access_username = network_access_username[:network_access_username.rfind('\x00')]
-        except Exception:
-            network_access_username = ""
+        except Exception as e:
+            error(f"Failed to deobfuscate NAA username: {e}")
+            info(f"Raw value (first 64 chars): [dim]{raw_username[:64]}...[/]")
+            network_access_username = None
 
         try:
-            network_access_password = deobfuscate_credential_string(naa_settings.xpath(".//*[@name='NetworkAccessPassword']")[0].find("value").text)
+            network_access_password = deobfuscate_credential_string(raw_password)
             network_access_password = network_access_password[:network_access_password.rfind('\x00')]
-        except Exception:
-            network_access_password = ""
+        except Exception as e:
+            error(f"Failed to deobfuscate NAA password: {e}")
+            info(f"Raw value (first 64 chars): [dim]{raw_password[:64]}...[/]")
+            network_access_password = None
 
-        if network_access_username or network_access_password:
-            cred("NAA Username", network_access_username or "(empty)")
-            cred("NAA Password", network_access_password or "(empty)")
+        if network_access_username and network_access_password:
+            cred("NAA Username", network_access_username)
+            cred("NAA Password", network_access_password)
+        elif network_access_username is None or network_access_password is None:
+            pass  # errors already printed above
         else:
-            warning("NAA entry found but credentials are empty (stale policy version?)")
+            warning("NAA credentials decrypted but values are empty")
 
 def process_task_sequence_xml(ts_xml):
     root = ET.fromstring(ts_xml)
