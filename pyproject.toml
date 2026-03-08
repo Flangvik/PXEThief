@@ -1,0 +1,19 @@
+[project]
+name = "pxethief"
+version = "1.0.0"
+description = "MECM/SCCM PXE Boot exploitation tool"
+readme = "README.md"
+license = "GPL-3.0-only"
+requires-python = ">=3.9"
+dependencies = [
+    "scapy>=2.5.0",
+    "requests>=2.27.1",
+    "requests-toolbelt>=0.9.1",
+    "pycryptodome>=3.14.1",
+    "lxml>=4.9.1",
+    "cryptography>=38.0.0",
+    "asn1crypto>=1.5.1",
+]
+
+[tool.uv]
+dev-dependencies = []
