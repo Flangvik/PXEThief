@@ -6,3 +6,6 @@ lxml>=4.9.1
 cryptography>=38.0.0
 asn1crypto>=1.5.1
 rich>=13.0.0
+pysocks>=1.7.1
+# Optional: SMB fallback when TFTP fails over SOCKS5
+# impacket>=0.11.0

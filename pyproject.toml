@@ -14,7 +14,11 @@ dependencies = [
     "cryptography>=38.0.0",
     "asn1crypto>=1.5.1",
     "rich>=13.0.0",
+    "pysocks>=1.7.1",
 ]
+
+[project.optional-dependencies]
+smb = ["impacket>=0.11.0"]
 
 [tool.uv]
 dev-dependencies = []
