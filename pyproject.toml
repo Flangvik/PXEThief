@@ -17,8 +17,5 @@ dependencies = [
     "pysocks>=1.7.1",
 ]
 
-[project.optional-dependencies]
-smb = ["impacket>=0.11.0"]
-
 [tool.uv]
 dev-dependencies = []

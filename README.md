@@ -85,14 +85,13 @@ python pxethief.py 3 variables.var cracked-password --proxy socks5://127.0.0.1:1
 
 **How it works over SOCKS5:**
 - PXE boot exchange (UDP 4011) goes through SOCKS5 UDP ASSOCIATE
-- TFTP file download goes through SOCKS5 UDP relay
-- If TFTP fails (some C2s have limited UDP relay), falls back to SMB download from `REMINST` share (requires `impacket`: `pip install impacket`)
+- TFTP file download goes through SOCKS5 UDP relay (PySocks handles TID port tracking)
 - HTTP policy retrieval uses `socks5h://` (DNS resolved at proxy) through `requests`
+- No Npcap/libpcap/root required -- all networking uses standard sockets through PySocks
 
 **Limitations:**
 - Mode 1 (DHCP broadcast discovery) cannot work over SOCKS5 -- use mode 2 with the DP IP
-- SOCKS5 server must support UDP ASSOCIATE for modes 1/2
-- Npcap/libpcap is NOT required when using `--proxy` (no raw sockets needed)
+- SOCKS5 server must support UDP ASSOCIATE (most C2 frameworks do: Cobalt Strike, Sliver, Mythic, etc.)
 
 ## Configuration
 

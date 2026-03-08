@@ -67,10 +67,6 @@ try:
 except ImportError:
     pysocks = None
 
-try:
-    from impacket.smbconnection import SMBConnection as ImpacketSMB
-except ImportError:
-    ImpacketSMB = None
 
 console = Console(highlight=False)
 
@@ -393,44 +389,6 @@ def configure_proxy_networking():
     mac_str = ':'.join(f'{b:02x}' for b in clientMacAddress)
     success(f"SOCKS5 proxy mode — random MAC [bold]{mac_str}[/]")
 
-def smb_download(server, remote_path, local_path):
-    """Download a file via SMB from REMINST share, through SOCKS5 proxy."""
-    if ImpacketSMB is None:
-        error("impacket is required for SMB fallback — [bold]pip install impacket[/]")
-        return False
-
-    share = 'REMINST'
-    smb_path = remote_path.replace('/', '\\')
-    if not smb_path.startswith('\\'):
-        smb_path = '\\' + smb_path
-
-    original_socket = socket.socket
-    if SOCKS5_PROXY:
-        pysocks.set_default_proxy(pysocks.SOCKS5, SOCKS5_PROXY[0], SOCKS5_PROXY[1],
-                                  username=SOCKS5_PROXY[2], password=SOCKS5_PROXY[3])
-        socket.socket = pysocks.socksocket
-
-    try:
-        conn = ImpacketSMB(server, server, sess_port=445, timeout=30)
-        conn.login('', '')
-        info(f"Connected to [bold]\\\\{server}\\{share}[/] (anonymous)")
-
-        file_data = bytearray()
-        def recv_cb(data):
-            file_data.extend(data)
-
-        conn.getFile(share, smb_path, recv_cb)
-        conn.close()
-
-        with open(local_path, 'wb') as f:
-            f.write(file_data)
-        return len(file_data)
-    except Exception as e:
-        error(f"SMB download failed: {e}")
-        return False
-    finally:
-        socket.socket = original_socket
-
 def print_interface_table():
     load_scapy()
     warning("Set the interface to be used by scapy in [bold]manual_interface_selection_by_id[/] in settings.ini")
@@ -679,19 +637,8 @@ def get_pxe_files(ip):
         size = tftp_download(tftp_server_ip, variables_file, var_file_name)
         success(f"Downloaded [bold]{var_file_name}[/] ({size} bytes)")
     except Exception as e:
-        if SOCKS5_PROXY:
-            warning(f"TFTP over SOCKS5 failed: {e}")
-            info("Attempting SMB fallback via REMINST share...")
-            smb_result = smb_download(tftp_server_ip, variables_file, var_file_name)
-            if smb_result:
-                success(f"Downloaded [bold]{var_file_name}[/] via SMB ({smb_result} bytes)")
-            else:
-                error("Both TFTP and SMB download failed")
-                info("Download the file manually and use mode 3: [bold]pxethief.py 3 <file> [password][/]")
-                sys.exit(-1)
-        else:
-            error(f"Failed to download media variables file via TFTP: {e}")
-            sys.exit(-1)
+        error(f"Failed to download media variables file via TFTP: {e}")
+        sys.exit(-1)
 
     info(f"Downloading [bold]{bcd_file_name}[/] via TFTP...")
     try:
