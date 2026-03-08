@@ -129,31 +129,58 @@ def cms_decrypt(private_key, encrypted_data):
 
     recipient_infos = enveloped_data['recipient_infos']
     recipient_info = recipient_infos[0].chosen
-    encrypted_key = recipient_info['encrypted_key'].native
+    encrypted_key_bytes = recipient_info['encrypted_key'].native
 
-    content_encryption_key = private_key.decrypt(
-        encrypted_key,
-        asym_padding.PKCS1v15()
-    )
+    # Try multiple RSA padding schemes — SCCM may use PKCS1v15 or OAEP
+    # PKCS1v15 can silently produce garbage keys when OAEP was used, so we
+    # validate the decrypted key size against known symmetric key lengths
+    valid_key_sizes = {8, 16, 24, 32}
+    content_encryption_key = None
 
+    paddings = [
+        ("PKCS1v15", asym_padding.PKCS1v15()),
+        ("OAEP-SHA1", asym_padding.OAEP(
+            mgf=asym_padding.MGF1(algorithm=hashes.SHA1()),
+            algorithm=hashes.SHA1(), label=None)),
+        ("OAEP-SHA256", asym_padding.OAEP(
+            mgf=asym_padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(), label=None)),
+    ]
+
+    for pad_name, pad in paddings:
+        try:
+            cek = private_key.decrypt(encrypted_key_bytes, pad)
+            if len(cek) in valid_key_sizes:
+                content_encryption_key = cek
+                break
+        except Exception:
+            continue
+
+    if content_encryption_key is None:
+        raise ValueError("Could not decrypt content encryption key — tried PKCS1v15, OAEP-SHA1, OAEP-SHA256")
+
+    # Get encrypted content and algorithm info
     encrypted_content_info = enveloped_data['encrypted_content_info']
     encrypted_content = encrypted_content_info['encrypted_content'].native
     algorithm = encrypted_content_info['content_encryption_algorithm']
     algo_oid = algorithm['algorithm'].dotted
     iv = algorithm['parameters'].native
 
-    if algo_oid == '1.2.840.113549.3.7':  # 3DES-CBC
+    # Select cipher — prefer OID but fall back to key size
+    key_len = len(content_encryption_key)
+    if algo_oid == '1.2.840.113549.3.7' or key_len == 24:  # 3DES-CBC
         cipher = Cipher(algorithms.TripleDES(content_encryption_key), modes.CBC(iv))
-    elif algo_oid == '2.16.840.1.101.3.4.1.2':  # AES-128-CBC
+    elif algo_oid == '2.16.840.1.101.3.4.1.2' or key_len == 16:  # AES-128-CBC
         cipher = Cipher(algorithms.AES(content_encryption_key), modes.CBC(iv))
-    elif algo_oid == '2.16.840.1.101.3.4.1.42':  # AES-256-CBC
+    elif algo_oid == '2.16.840.1.101.3.4.1.42' or key_len == 32:  # AES-256-CBC
         cipher = Cipher(algorithms.AES(content_encryption_key), modes.CBC(iv))
     else:
-        raise ValueError("Unsupported content encryption algorithm: " + algo_oid)
+        raise ValueError(f"Unsupported algorithm OID {algo_oid} with key size {key_len * 8} bits")
 
     decryptor = cipher.decryptor()
     decrypted = decryptor.update(encrypted_content) + decryptor.finalize()
 
+    # Strip PKCS#7 padding
     pad_len = decrypted[-1]
     if 0 < pad_len <= len(decrypted) and all(b == pad_len for b in decrypted[-pad_len:]):
         decrypted = decrypted[:-pad_len]
