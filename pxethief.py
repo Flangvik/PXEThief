@@ -736,14 +736,28 @@ def process_naa_xml(naa_xml):
     root = ET.fromstring(naa_xml)
     network_access_account_xml = root.xpath("//*[@class='CCM_NetworkAccessAccount']")
 
-    for naa_settings in network_access_account_xml:
-        network_access_username = deobfuscate_credential_string(naa_settings.xpath(".//*[@name='NetworkAccessUsername']")[0].find("value").text)
-        network_access_username = network_access_username[:network_access_username.rfind('\x00')]
-        cred("NAA Username", network_access_username)
+    if not network_access_account_xml:
+        warning("No Network Access Account configuration found in policy")
+        return
 
-        network_access_password = deobfuscate_credential_string(naa_settings.xpath(".//*[@name='NetworkAccessPassword']")[0].find("value").text)
-        network_access_password = network_access_password[:network_access_password.rfind('\x00')]
-        cred("NAA Password", network_access_password)
+    for naa_settings in network_access_account_xml:
+        try:
+            network_access_username = deobfuscate_credential_string(naa_settings.xpath(".//*[@name='NetworkAccessUsername']")[0].find("value").text)
+            network_access_username = network_access_username[:network_access_username.rfind('\x00')]
+        except Exception:
+            network_access_username = ""
+
+        try:
+            network_access_password = deobfuscate_credential_string(naa_settings.xpath(".//*[@name='NetworkAccessPassword']")[0].find("value").text)
+            network_access_password = network_access_password[:network_access_password.rfind('\x00')]
+        except Exception:
+            network_access_password = ""
+
+        if network_access_username or network_access_password:
+            cred("NAA Username", network_access_username or "(empty)")
+            cred("NAA Password", network_access_password or "(empty)")
+        else:
+            warning("NAA entry found but credentials are empty (stale policy version?)")
 
 def process_task_sequence_xml(ts_xml):
     root = ET.fromstring(ts_xml)
