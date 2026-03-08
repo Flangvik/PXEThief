@@ -190,6 +190,8 @@ BLANK_PASSWORDS_FOUND = False
 
 # SOCKS5 Proxy — set via --proxy flag, tuple of (host, port, username, password) or None
 SOCKS5_PROXY = None
+# Source IP for BOOTP ciaddr in proxy mode — set via --source-ip flag
+SOCKS5_SOURCE_IP = None
 
 def safe_decode_utf16le(data, label="data"):
     try:
@@ -382,12 +384,15 @@ def create_socks5_udp_socket(timeout=10):
 def configure_proxy_networking():
     """Set up networking for SOCKS5 proxy mode — no local interface needed."""
     global clientIPAddress, clientMacAddress
-    clientIPAddress = "0.0.0.0"
+    if SOCKS5_SOURCE_IP:
+        clientIPAddress = SOCKS5_SOURCE_IP
+    else:
+        clientIPAddress = "0.0.0.0"
     mac_bytes = os.urandom(6)
     mac_bytes = bytes([(mac_bytes[0] | 0x02) & 0xFE]) + mac_bytes[1:]
     clientMacAddress = mac_bytes
     mac_str = ':'.join(f'{b:02x}' for b in clientMacAddress)
-    success(f"SOCKS5 proxy mode — random MAC [bold]{mac_str}[/]")
+    success(f"SOCKS5 proxy mode — MAC [bold]{mac_str}[/] — ciaddr [bold]{clientIPAddress}[/]")
 
 def print_interface_table():
     load_scapy()
@@ -1226,6 +1231,7 @@ def print_usage():
     console.print()
     console.print("[bold cyan]Options:[/]")
     console.print("  [bold yellow]--proxy socks5://[user:pass@]host:port[/]   Route all traffic through a SOCKS5 proxy")
+    console.print("  [bold yellow]--source-ip <IP>[/]                         IP of the SOCKS5 host (used as BOOTP ciaddr)")
 
 if __name__ == "__main__":
 
@@ -1248,6 +1254,15 @@ if __name__ == "__main__":
             sys.exit(1)
 
         SOCKS5_PROXY = (parsed.hostname, parsed.port or 1080, parsed.username, parsed.password)
+
+    # Extract --source-ip flag (IP of the host running the SOCKS5 proxy, used as BOOTP ciaddr)
+    if '--source-ip' in sys.argv:
+        idx = sys.argv.index('--source-ip')
+        if idx + 1 >= len(sys.argv):
+            print("[-] --source-ip requires an IP address argument")
+            sys.exit(1)
+        SOCKS5_SOURCE_IP = sys.argv[idx + 1]
+        del sys.argv[idx:idx + 2]
 
     if len(sys.argv) < 2 or sys.argv[1] == "-h":
         print_usage()
